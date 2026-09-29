@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adaptive-os-mvp"
+version = "0.1.0"
+description = "Synthetic Docker CPU-share feasibility experiment"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+adaptive-os = "adaptive_os.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
