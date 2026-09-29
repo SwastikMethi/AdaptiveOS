@@ -2,3 +2,5 @@
 !Dockerfile.workloads
 !workloads/
 !workloads/*.py
+**/__pycache__/
+**/*.pyc

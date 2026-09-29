@@ -24,7 +24,9 @@ def main():
     if min(period, budget) < 1 or duration < period:
         parser.error("duration must cover one period; budget and period must be at least 1 ns")
     start = args.start_ns if args.start_ns is not None else time.monotonic_ns()
-    time.sleep(max(0, (start - time.monotonic_ns()) / 1_000_000_000))
+    delay = start - time.monotonic_ns()
+    if delay > 0:
+        time.sleep(delay / 1_000_000_000)
     cpu_start = time.thread_time_ns()
     digest = bytes(32)
     summary_start, summary_sequence, ticks, misses, units = start, 0, 0, 0, 0
@@ -43,7 +45,9 @@ def main():
 
     for sequence in range(duration // period):
         scheduled = start + sequence * period
-        time.sleep(max(0, (scheduled - time.monotonic_ns()) / 1_000_000_000))
+        delay = scheduled - time.monotonic_ns()
+        if delay > 0:
+            time.sleep(delay / 1_000_000_000)
         wakeup = time.monotonic_ns()
         deadline = scheduled + period
         work_units = 0
@@ -61,7 +65,9 @@ def main():
         ticks, misses, units = ticks + 1, misses + int(not met), units + work_units
         if completion - summary_start >= 1_000_000_000:
             summary(completion)
-    time.sleep(max(0, (start + duration - time.monotonic_ns()) / 1_000_000_000))
+    delay = start + duration - time.monotonic_ns()
+    if delay > 0:
+        time.sleep(delay / 1_000_000_000)
     summary(time.monotonic_ns())
 
 

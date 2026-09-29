@@ -15,7 +15,8 @@ import uuid
 PROJECT = "adaptive-os-mvp"
 BASE_IMAGE = "python:3.11-slim-bookworm@sha256:a36c24f9cbdf4fd0f52d67f0823eeac19c2028c637cecc392d97f980d4fec56b"
 INSPECT_FORMAT = ('{"labels":{{json .Config.Labels}},"shares":{{json .HostConfig.CpuShares}},'
-                  '"running":{{json .State.Running}},"cpuset":{{json .HostConfig.CpusetCpus}}}')
+                  '"running":{{json .State.Running}},"cpuset":{{json .HostConfig.CpusetCpus}},'
+                  '"exit_code":{{json .State.ExitCode}},"oom_killed":{{json .State.OOMKilled}}}')
 
 
 class DockerError(RuntimeError):
@@ -137,6 +138,15 @@ class DockerRuntime:
         self.inspect_owned(container_id, expected_run_id)
         return self._read_weight(container_id)
 
+    def wait_owned(self, container_id: str, *, expected_run_id: str) -> dict:
+        self.inspect_owned(container_id, expected_run_id)
+        exit_text = self._run(["wait", container_id], timeout=5)
+        state = self.inspect_owned(container_id, expected_run_id)
+        if (state["running"] or type(state.get("exit_code")) is not int
+                or type(state.get("oom_killed")) is not bool or exit_text != str(state["exit_code"])):
+            raise DockerError(f"unverifiable final workload state for {container_id}")
+        return state
+
     def update_shares(self, container_id: str, shares: int, *, expected_run_id: str) -> ShareUpdate:
         if type(shares) is not int or shares not in (128, 1024):
             raise ValueError("allowed CPU shares are 128 and 1024")
@@ -243,8 +253,12 @@ def run_preflight(runtime: DockerRuntime, output_dir: Path, *, run_id: str | Non
         data.update(os_type=os_type, cgroup_version=cgroup_version)
         if cgroup_version != "2":
             raise UnsupportedEnvironment("cgroup v2 is required; cgroup v1 detected")
-        endpoint = os.environ.get("DOCKER_HOST") or json.loads(runtime._run(
-            ["context", "inspect", "--format", "{{json .Endpoints.docker.Host}}"] ))
+        # Docker gives DOCKER_CONTEXT precedence over DOCKER_HOST.
+        context = os.environ.get("DOCKER_CONTEXT")
+        endpoint = None if context else os.environ.get("DOCKER_HOST")
+        if not endpoint:
+            args = ["context", "inspect", "--format", "{{json .Endpoints.docker.Host}}"]
+            endpoint = json.loads(runtime._run(args + ([context] if context else [])))
         if not isinstance(endpoint, str) or not endpoint.startswith("unix://"):
             raise UnsupportedEnvironment("preflight requires a local Docker Unix socket; remote contexts are outside scope")
         data["docker_host"] = json.loads(runtime._run(["info", "--format",

@@ -93,7 +93,8 @@ class WindowAccumulator:
         return cpu, units, covered
 
     def build_window(self, start_ns, end_ns, *, now_ns, current_mode="balanced",
-                     elapsed_since_last_change_sec=0.0, cpu_pressure_some_delta=None) -> WindowState:
+                     elapsed_since_last_change_sec=0.0, cpu_pressure_some_delta=None,
+                     window_end_host_ns=None) -> WindowState:
         duration = end_ns - start_ns
         if duration <= 0 or duration % self.period_ns:
             raise ValueError("window must contain a positive whole number of periods")
@@ -113,6 +114,11 @@ class WindowAccumulator:
             required.append("background_summary")
         age = max(max(0, (now_ns - self.received[kind]) / 1_000_000_000) if kind in self.received else 3.0
                   for kind in required)
+        if window_end_host_ns is not None:
+            processing_age = max(0, (now_ns - window_end_host_ns) / 1_000_000_000)
+            if processing_age > 2:
+                reasons.append("window processed too late")
+            age = max(age, processing_age)
         if age > 2:
             reasons.append("stale telemetry")
         if cpu_pressure_some_delta is not None and cpu_pressure_some_delta < 0:

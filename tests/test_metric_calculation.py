@@ -1,8 +1,12 @@
 import json
+import io
 from pathlib import Path
 import subprocess
 import sys
 import unittest
+from unittest.mock import patch
+
+from workloads import foreground, background
 
 from adaptive_os.workloads import WorkloadProfile, parse_workload_line
 from adaptive_os.telemetry import (WindowAccumulator, completion_lateness_ms,
@@ -21,6 +25,19 @@ def tick(**changes):
 
 
 class WorkloadTest(unittest.TestCase):
+    def test_overdue_periods_are_counted_without_yielding_again(self):
+        for module in (foreground, background):
+            sleeps = []
+            output = io.StringIO()
+            with patch.object(sys, "argv", ["workload", "--duration-sec", "0.1", "--start-ns", "1"]), \
+                    patch.object(module.time, "sleep", side_effect=sleeps.append), patch.object(sys, "stdout", output):
+                module.main()
+            self.assertEqual(sleeps, [], module.__name__)
+            if module is foreground:
+                ticks = [json.loads(line) for line in output.getvalue().splitlines() if 'foreground_tick' in line]
+                self.assertEqual(len(ticks), 5)
+                self.assertTrue(all(tick["skipped"] and not tick["deadline_met"] for tick in ticks))
+
     def test_scripts_emit_recomputable_ticks_and_throughput(self):
         for workload in ("foreground", "background"):
             result = subprocess.run([sys.executable, str(ROOT / "workloads" / f"{workload}.py"),
@@ -102,6 +119,13 @@ class MetricTest(unittest.TestCase):
         missing = accumulator.build_window(2_000_000_000, 3_000_000_000, now_ns=5_100_000_000)
         self.assertFalse(missing.valid)
         self.assertIn("incomplete background coverage", missing.invalid_reasons)
+
+    def test_buffered_delivery_does_not_refresh_an_overdue_window(self):
+        accumulator = self.populated_accumulator()
+        state = accumulator.build_window(0, 2_000_000_000, now_ns=5_100_000_000,
+                                         window_end_host_ns=2_000_000_000)
+        self.assertFalse(state.valid)
+        self.assertIn("window processed too late", state.invalid_reasons)
 
 
 if __name__ == "__main__":

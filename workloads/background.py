@@ -17,7 +17,9 @@ def main():
     if args.start_ns is not None and args.start_ns < 0:
         parser.error("start time must be nonnegative")
     start = args.start_ns if args.start_ns is not None else time.monotonic_ns()
-    time.sleep(max(0, (start - time.monotonic_ns()) / 1_000_000_000))
+    delay = start - time.monotonic_ns()
+    if delay > 0:
+        time.sleep(delay / 1_000_000_000)
     cpu_start = time.thread_time_ns()
     end = start + round(args.duration_sec * 1_000_000_000)
     interval_start, sequence, units, digest = start, 0, 0, bytes(32)

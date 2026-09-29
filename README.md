@@ -39,7 +39,40 @@ Docker may download it on the first preflight. Containers run as an unprivileged
 user with networking disabled and a read-only root filesystem. Record host
 load, power/thermal conditions and VM settings before comparison experiments.
 
-Implementation begins with M0 (environment and CPU-weight control). Later
-milestones are gated on evidence from the preceding experiment.
+M0 (environment and CPU-weight control), synthetic workloads, raw telemetry,
+SQLite persistence and default-policy calibration are implemented. The rule,
+comparison report and optional model follow only after calibration passes.
+
+```sh
+docker build -f Dockerfile.workloads -t adaptive-os-workloads:dev .
+.venv/bin/adaptive-os calibrate --cpu auto --measurement-sec 15 --runs-dir runs
+# For hardware needing lighter loads, keep the same acceptance thresholds:
+.venv/bin/adaptive-os calibrate --budgets-ms 1 2 4 8 --runs-dir runs
+.venv/bin/adaptive-os run --policy default --profile light --trials 1 --duration-sec 20 --smoke
+```
+
+Calibration tests foreground alone and with a background competitor on the same
+CPU. It requires solo misses ≤0.5%, a light paired profile with misses ≤2%, and a
+contention profile with misses >2% or p95 lateness >1 ms. Failed attempts remain in
+`runs/calibration-*.json` and `runs/runs.sqlite3`; `profiles.json` is usable only
+when `valid` is true. Profiles and the workload image ID are then frozen. Build
+changes require recalibration. Calibration runs are marked as smoke data and
+must not be presented as a repeated policy comparison.
+
+Foreground records every scheduled 20 ms period. A period already overdue when
+the process wakes is counted as skipped/missed, rather than silently discarded.
+All latency calculations use Linux VM monotonic time. Host receipt time is used
+only for freshness, and CPU/work summaries are prorated at window boundaries.
+Raw records remain available to recompute the latency percentiles. A sleeping,
+labeled probe reads the VM clock and CPU pressure, pinned to another allowed CPU
+when one is available. Single-CPU environments record instrumentation as shared.
+
+The runner excludes five seconds of warm-up and requires all measurement windows
+to be complete and fresh. Controller CPU time currently measures the Python
+process, including its log-reader threads; Docker daemon/CLI CPU cost and host
+thermal/power effects are not isolated.
+
 See [the specification](Adaptive_OS_Controller_MVP.md) and
 [the implementation plan](docs/superpowers/plans/2026-09-29-adaptive-os-controller-mvp.md).
+Current verification results and the calibration gate are recorded in
+[implementation status](docs/implementation-status.md).

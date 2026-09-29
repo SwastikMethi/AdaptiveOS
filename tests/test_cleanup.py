@@ -3,6 +3,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from adaptive_os.docker_runtime import CleanupError, DockerError, DockerRuntime, OwnershipError
@@ -13,9 +14,10 @@ CID = "a" * 64
 OTHER = "b" * 64
 
 
-def metadata(shares=1024, *, run_id=RUN, project="adaptive-os-mvp", running=True):
+def metadata(shares=1024, *, run_id=RUN, project="adaptive-os-mvp", running=True, exit_code=0, oom_killed=False):
     return json.dumps({"labels": {"project": project, "run_id": run_id},
-                       "shares": shares, "running": running, "cpuset": "2"})
+                       "shares": shares, "running": running, "cpuset": "2",
+                       "exit_code": exit_code, "oom_killed": oom_killed})
 
 
 class FakeExecutor:
@@ -38,6 +40,13 @@ class FakeExecutor:
 
 
 class CleanupTest(unittest.TestCase):
+    def test_wait_checks_actual_container_exit_and_oom_state(self):
+        fake = FakeExecutor([metadata(), "137", metadata(running=False, exit_code=137, oom_killed=True)])
+        state = DockerRuntime(fake).wait_owned(CID, expected_run_id=RUN)
+        self.assertEqual(state["exit_code"], 137)
+        self.assertTrue(state["oom_killed"])
+        self.assertEqual(fake.commands[1], ["docker", "wait", CID])
+
     def test_launch_sets_labels_and_relative_shares_without_quota(self):
         fake = FakeExecutor([CID, metadata(), CID])
         self.assertEqual(DockerRuntime(fake).run_owned(RUN, 2, ["python", "-c", "while True: pass"]), CID)
@@ -188,6 +197,20 @@ class PreflightRuntime:
 
 
 class PreflightTest(unittest.TestCase):
+    def test_remote_context_override_cannot_be_masked_by_local_docker_host(self):
+        runtime = PreflightRuntime()
+        original_run = runtime._run
+
+        def output(args, **kwargs):
+            return '"ssh://remote.example"' if args[0] == "context" else original_run(args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.dict("os.environ", {"DOCKER_HOST": "unix:///local.sock", "DOCKER_CONTEXT": "remote"}), \
+                patch.object(runtime, "_run", side_effect=output):
+            result = run_preflight(runtime, Path(directory), run_id=RUN)
+        self.assertEqual(result.exit_code, 2)
+        self.assertEqual(runtime.containers, {})
+
     def test_capability_parsers_reject_malformed_data(self):
         self.assertEqual(parse_docker_info("linux 2\n"), ("linux", "2"))
         self.assertEqual(parse_affinity("[2, 4, 6]\n"), [2, 4, 6])
