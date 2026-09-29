@@ -1,0 +1,4 @@
+**
+!Dockerfile.workloads
+!workloads/
+!workloads/*.py
