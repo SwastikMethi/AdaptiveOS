@@ -1,9 +1,14 @@
 """Docker CLI boundary: mutations require both ownership labels and a full ID."""
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 import json
+import os
+from pathlib import Path
+import platform
 import re
 import subprocess
+import threading
 import time
 import uuid
 
@@ -173,3 +178,141 @@ class DockerRuntime:
         if errors:
             raise CleanupError(removed, errors)
         return removed
+
+
+class UnsupportedEnvironment(ValueError):
+    """A prerequisite for the cgroup v2 experiment is unavailable."""
+
+
+@dataclass(frozen=True)
+class PreflightResult:
+    path: Path
+    exit_code: int
+    supported: bool
+    reasons: tuple[str, ...]
+
+
+def parse_docker_info(raw: str) -> tuple[str, str]:
+    values = raw.split()
+    if len(values) != 2 or values[0] != "linux" or values[1] not in ("1", "2"):
+        raise ValueError("Docker must report Linux containers and a recognized cgroup version")
+    return values[0], values[1]
+
+
+def parse_affinity(raw: str) -> list[int]:
+    values = json.loads(raw)
+    if (not isinstance(values, list) or not values
+            or any(type(cpu) is not int or cpu < 0 for cpu in values)
+            or values != sorted(set(values))):
+        raise ValueError("affinity must be a sorted, nonempty list of distinct CPU IDs")
+    return values
+
+
+def run_preflight(runtime: DockerRuntime, output_dir: Path, *, run_id: str | None = None,
+                  stop_event: threading.Event | None = None) -> PreflightResult:
+    run_id = validate_run_id(run_id or str(uuid.uuid4()))
+    stop_event = stop_event or threading.Event()
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    started = datetime.now(timezone.utc)
+    path = output_dir / f"preflight-{started:%Y%m%dT%H%M%S%fZ}-{run_id}.json"
+    data = {"schema_version": 1, "run_id": run_id, "started_at_utc": started.isoformat(),
+            "supported": False, "degraded": False, "reasons": [], "status": "running",
+            "image": BASE_IMAGE, "selected_cpu": None,
+            "host": {"os": platform.system(), "release": platform.release(),
+                     "architecture": platform.machine(), "python": platform.python_version()},
+            "environment_notes": "Power saving, temperature and other host load are not controlled; record them before trials."}
+    path.write_text(json.dumps(data, indent=2) + "\n")
+    exit_code = 1
+    containers_attempted = False
+
+    def check_stop():
+        if stop_event.is_set():
+            raise InterruptedError("preflight interrupted; restoring and cleaning up owned containers")
+
+    try:
+        check_stop()
+        data["docker_version"] = json.loads(runtime._run(["version", "--format", "{{json .}}"] ))
+        if not isinstance(data["docker_version"], dict) or not data["docker_version"].get("Server"):
+            raise UnsupportedEnvironment("Docker daemon is unavailable")
+        info = runtime._run(["info", "--format", "{{.OSType}} {{.CgroupVersion}}"])
+        try:
+            os_type, cgroup_version = parse_docker_info(info)
+        except ValueError as exc:
+            raise UnsupportedEnvironment(str(exc)) from exc
+        data.update(os_type=os_type, cgroup_version=cgroup_version)
+        if cgroup_version != "2":
+            raise UnsupportedEnvironment("cgroup v2 is required; cgroup v1 detected")
+        endpoint = os.environ.get("DOCKER_HOST") or json.loads(runtime._run(
+            ["context", "inspect", "--format", "{{json .Endpoints.docker.Host}}"] ))
+        if not isinstance(endpoint, str) or not endpoint.startswith("unix://"):
+            raise UnsupportedEnvironment("preflight requires a local Docker Unix socket; remote contexts are outside scope")
+        data["docker_host"] = json.loads(runtime._run(["info", "--format",
+            '{"kernel":{{json .KernelVersion}},"cpus":{{.NCPU}},"memory_bytes":{{.MemTotal}},'
+            '"operating_system":{{json .OperatingSystem}},"architecture":{{json .Architecture}}}']))
+        check_stop()
+        containers_attempted = True
+        probe = runtime.run_owned(run_id, None, ["python", "-c", "import time; time.sleep(600)"])
+        data["probe_container"] = probe
+        data["resolved_image"] = json.loads(runtime._run(["image", "inspect", "--format",
+            '{"id":{{json .Id}},"architecture":{{json .Architecture}},"os":{{json .Os}}}', BASE_IMAGE]))
+        try:
+            data["allowed_cpus"] = parse_affinity(runtime.exec_owned(probe,
+                ["python", "-c", "import os; print(sorted(os.sched_getaffinity(0)))"], expected_run_id=run_id))
+        except ValueError as exc:
+            raise UnsupportedEnvironment(str(exc)) from exc
+        cpu = data["selected_cpu"] = data["allowed_cpus"][0]
+        try:
+            data["cpu_pressure"] = runtime.exec_owned(probe, ["cat", "/proc/pressure/cpu"], expected_run_id=run_id)
+            if not re.search(r"^some .*\btotal=\d+\s*$", data["cpu_pressure"], re.MULTILINE):
+                raise DockerError("CPU PSI 'some total' is unavailable or malformed")
+            data["probe_weight"] = runtime.read_cpu_weight(probe, expected_run_id=run_id)
+        except DockerError as exc:
+            data["degraded"] = True
+            raise UnsupportedEnvironment(f"cgroup v2 telemetry unavailable: {exc}") from exc
+        check_stop()
+        smoke = runtime.run_owned(run_id, cpu, ["python", "-c", "while True: pass"])
+        data["smoke_container"] = smoke
+        before = runtime.inspect_owned(smoke, run_id)
+        pinned = parse_affinity(runtime.exec_owned(smoke,
+            ["python", "-c", "import os; print(sorted(os.sched_getaffinity(0)))"], expected_run_id=run_id))
+        if pinned != [cpu] or before["cpuset"] != str(cpu):
+            raise UnsupportedEnvironment("test container could not be pinned to the selected CPU")
+        if before["shares"] != 1024:
+            raise DockerError("owned container did not start with baseline shares")
+        initial_weight = runtime.read_cpu_weight(smoke, expected_run_id=run_id)
+        data["smoke"] = {"initial_shares": before["shares"], "initial_weight": initial_weight}
+        check_stop()
+        changed = runtime.update_shares(smoke, 128, expected_run_id=run_id)
+        data["smoke"]["change"] = asdict(changed)
+        if changed.effective_weight is None or changed.effective_weight >= initial_weight:
+            raise DockerError("lower shares did not lower effective cpu.weight")
+        check_stop()
+        restored = runtime.update_shares(smoke, before["shares"], expected_run_id=run_id)
+        data["smoke"].update(restore=asdict(restored), restored_weight=restored.effective_weight)
+        if restored.effective_weight != initial_weight:
+            raise DockerError("effective cpu.weight was not restored to its initial value")
+        exit_code = 0
+    except UnsupportedEnvironment as exc:
+        data["reasons"].append(str(exc))
+        exit_code = 2
+    except (DockerError, ValueError, OSError) as exc:
+        data["reasons"].append(str(exc))
+        exit_code = 1
+    finally:
+        if containers_attempted:
+            try:
+                data["removed_containers"] = runtime.cleanup_run(run_id)
+                remaining = runtime._run(["ps", "-aq", "--no-trunc", "--filter", f"label=project={PROJECT}",
+                                          "--filter", f"label=run_id={run_id}"])
+                if remaining:
+                    raise DockerError(f"owned containers remain after cleanup: {remaining}")
+            except DockerError as exc:
+                if isinstance(exc, CleanupError):
+                    data["removed_containers"] = exc.removed
+                data["reasons"].append(f"cleanup failed: {exc}")
+                exit_code = 1
+        data.update(supported=exit_code == 0, status="complete", exit_code=exit_code,
+                    commands=runtime.commands, finished_at_utc=datetime.now(timezone.utc).isoformat())
+        path.write_text(json.dumps(data, indent=2) + "\n")
+    return PreflightResult(path, exit_code, data["supported"], tuple(data["reasons"]))

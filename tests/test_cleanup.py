@@ -1,8 +1,12 @@
 import json
 import subprocess
+import tempfile
+import threading
 import unittest
+from pathlib import Path
 
 from adaptive_os.docker_runtime import CleanupError, DockerError, DockerRuntime, OwnershipError
+from adaptive_os.docker_runtime import parse_affinity, parse_docker_info, run_preflight, ShareUpdate
 
 RUN = "12345678-1234-4234-8234-123456789abc"
 CID = "a" * 64
@@ -114,6 +118,125 @@ class CleanupTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     runtime.update_shares(cid, shares, expected_run_id=run_id)
         self.assertEqual(fake.commands, [])
+
+
+class PreflightRuntime:
+    """Local state double for preflight; real command safety is covered above."""
+    def __init__(self, *, info="linux 2", fail_update=False, fail_cleanup=False, psi=True, stop=None):
+        self.info = info
+        self.fail_update = fail_update
+        self.fail_cleanup = fail_cleanup
+        self.psi = psi
+        self.stop = stop
+        self.commands = []
+        self.containers = {}
+        self.updates = []
+        self.cleaned = False
+
+    def _run(self, args, **kwargs):
+        if args[0] == "version":
+            return '{"Client":{"Version":"29","Context":"desktop-linux"},"Server":{"Version":"29"}}'
+        if args[0] == "context":
+            return '"unix:///test/docker.sock"'
+        if args[0] == "info":
+            return self.info if args[2] == "{{.OSType}} {{.CgroupVersion}}" else '{"cpus":4,"memory_bytes":8000000000,"kernel":"linux"}'
+        if args[:2] == ["image", "inspect"]:
+            return '{"id":"sha256:test","architecture":"arm64","os":"linux"}'
+        if args[0] == "ps":
+            return ""
+        raise AssertionError(args)
+
+    def run_owned(self, run_id, cpu, command, **kwargs):
+        cid = CID if cpu is None else OTHER
+        self.containers[cid] = {"shares": 1024, "cpu": cpu}
+        return cid
+
+    def inspect_owned(self, cid, run_id):
+        cpu = self.containers[cid]["cpu"]
+        return {"shares": self.containers[cid]["shares"], "running": True, "cpuset": str(cpu)}
+
+    def exec_owned(self, cid, command, **kwargs):
+        if "sched_getaffinity" in command[-1]:
+            return "[2, 4, 6]" if cid == CID else "[2]"
+        if not self.psi:
+            raise DockerError("/proc/pressure/cpu: No such file")
+        return "some avg10=0.00 avg60=0.00 avg300=0.00 total=12345\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0"
+
+    def read_cpu_weight(self, cid, **kwargs):
+        return 39 if self.containers[cid]["shares"] == 1024 else 5
+
+    def update_shares(self, cid, shares, **kwargs):
+        original = self.containers[cid]["shares"]
+        self.containers[cid]["shares"] = shares
+        self.updates.append(shares)
+        if shares == 128 and self.stop:
+            self.stop.set()
+        if shares == 128 and self.fail_update:
+            raise DockerError("effective cpu.weight did not change")
+        return ShareUpdate(original, shares, 39 if shares == 1024 else 5, cid)
+
+    def cleanup_run(self, run_id):
+        self.cleaned = True
+        for cid, state in self.containers.items():
+            if state["shares"] != 1024:
+                self.update_shares(cid, 1024)
+        removed = list(self.containers)
+        self.containers.clear()
+        if self.fail_cleanup:
+            raise CleanupError([], ["remove failed"])
+        return removed
+
+
+class PreflightTest(unittest.TestCase):
+    def test_capability_parsers_reject_malformed_data(self):
+        self.assertEqual(parse_docker_info("linux 2\n"), ("linux", "2"))
+        self.assertEqual(parse_affinity("[2, 4, 6]\n"), [2, 4, 6])
+        for data in ("[]", "[true]", "[-1]", "[2,2]", "null", "[1.5]", "[4,2]"):
+            with self.subTest(data=data), self.assertRaises(ValueError):
+                parse_affinity(data)
+        with self.assertRaises(ValueError):
+            parse_docker_info("windows 2")
+
+    def test_preflight_selects_allowed_cpu_proves_restore_and_persists(self):
+        runtime = PreflightRuntime()
+        with tempfile.TemporaryDirectory() as directory:
+            result = run_preflight(runtime, Path(directory), run_id=RUN)
+            data = json.loads(result.path.read_text())
+        self.assertEqual(result.exit_code, 0)
+        self.assertTrue(data["supported"])
+        self.assertEqual(data["selected_cpu"], 2)
+        self.assertEqual(data["smoke"]["initial_weight"], data["smoke"]["restored_weight"])
+        self.assertEqual(runtime.updates, [128, 1024])
+        self.assertTrue(runtime.cleaned)
+
+    def test_cgroup_v1_and_missing_psi_are_explicitly_unsupported(self):
+        for runtime in (PreflightRuntime(info="linux 1"), PreflightRuntime(psi=False)):
+            with tempfile.TemporaryDirectory() as directory:
+                result = run_preflight(runtime, Path(directory), run_id=RUN)
+                data = json.loads(result.path.read_text())
+            self.assertEqual(result.exit_code, 2)
+            self.assertFalse(data["supported"])
+            self.assertTrue(data["reasons"])
+
+    def test_failed_update_and_interruption_restore_before_cleanup(self):
+        stop = threading.Event()
+        for runtime in (PreflightRuntime(fail_update=True), PreflightRuntime(stop=stop)):
+            with tempfile.TemporaryDirectory() as directory:
+                result = run_preflight(runtime, Path(directory), run_id=RUN, stop_event=stop)
+                data = json.loads(result.path.read_text())
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertFalse(data["supported"])
+            self.assertEqual(runtime.updates, [128, 1024])
+            self.assertTrue(runtime.cleaned)
+
+    def test_cleanup_failure_cannot_be_reported_as_supported(self):
+        runtime = PreflightRuntime(fail_cleanup=True)
+        with tempfile.TemporaryDirectory() as directory:
+            result = run_preflight(runtime, Path(directory), run_id=RUN)
+            data = json.loads(result.path.read_text())
+        self.assertEqual(result.exit_code, 1)
+        self.assertFalse(data["supported"])
+        self.assertIn("remove failed", " ".join(data["reasons"]))
 
 
 if __name__ == "__main__":
