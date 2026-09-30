@@ -1,5 +1,78 @@
 # Adaptive OS Controller
 
+## Native desktop app (macOS)
+
+One Debian Linux Docker sandbox contains **all** competing workloads and its
+telemetry collector. This is a native Qt app, not a website. Docker Desktop must
+be installed and running; no browser, ports, or Docker socket inside the sandbox.
+
+```sh
+python3.11 -m venv .venv
+.venv/bin/python -m pip install -e '.[desktop]'
+.venv/bin/adaptive-os desktop
+```
+
+Click **Start sandbox** (the pinned image builds on first use), then **Start all**.
+The starter pair is a periodic task and continuous CPU hashing. Add memory-touch
+and file-I/O presets up to eight workloads. All compete on the same Linux CPU;
+the collector uses another allowed CPU where available. Select a row to change
+its live CPU priority, or stop it to edit its settings. Stop the sandbox to save
+the recording and remove its temporary container and scratch volume.
+
+CPU 100% means one saturated logical CPU. RSS is resident MiB; memory throughput
+counts bytes actually touched (one byte per page), not the whole allocated
+buffer. File I/O uses a bounded 64 MiB file with periodic fsync; application
+throughput includes reads served from cache. Kernel read/write counters are
+shown separately. Periodic tasks have a 20 ms period; their first five seconds
+are warm-up. Missing/stale metrics show gaps, never invented zeros. This is an
+observational playground, not a calibrated policy comparison.
+
+Priority options are nice 0/10/19 (Normal/Reduced/Minimal), checked with a real
+0→10→19→0 probe **inside the same container**. Unsupported systems remain in
+monitoring-only mode. The sandbox runs non-root, with no network, a read-only
+root, dropped capabilities, a 1 GiB memory limit and 64-process limit. A ten-second
+heartbeat lease stops workloads if the app dies. On reopening, **Recover…**
+offers removal of only the exact labeled leftover session; recordings are kept.
+
+The **Recordings** tab opens saved charts/events without Docker and exports full
+JSON or CSV records. Stop the live sandbox before browsing/exporting. The live
+plots retain 300 points; history shows up to 300 observed points per workload;
+exports retain every recorded sample and raw tick. Desktop data is separate from
+legacy `runs/`, in Qt's macOS Application Support folder for Adaptive OS Controller
+(the exact path is shown in the status bar). Override it with `desktop --data-dir PATH`.
+
+Build a locally runnable app (Xcode Command Line Tools required):
+
+```sh
+.venv/bin/python scripts/build_desktop.py
+open 'dist/Adaptive OS Controller.app'
+```
+
+The bundle includes Python, Qt and the sandbox sources; no activated venv is
+needed to launch it. It still needs Docker Desktop. The build installs Nuitka
+4.1.1 and uses pyside6-deploy. Ad-hoc local signing is included; public distribution
+signing/notarization is not. Previous local bundles are retained in `dist/previous-*.app`.
+PySide6/Qt and Nuitka retain their respective third-party licenses.
+
+Verification (Docker checks create and clean only their own session resources):
+
+```sh
+.venv/bin/python -m unittest discover -q
+.venv/bin/python scripts/verify_desktop.py --seconds 45 --workloads 8 --lease
+.venv/bin/python scripts/verify_desktop_ui.py --seconds 600
+```
+
+If Docker is missing or stopped, launch it and click Start sandbox again. Build
+errors appear in the timeline. A disk/recording error stops the sandbox rather
+than silently losing measurements. Keep `sessions-v2.sqlite3` plus its WAL files
+together for recovery; do not edit an active database. Custom shell workloads,
+automatic scheduling policies and native macOS process control are not included.
+
+## Legacy CLI benchmark workflow
+
+The commands below are the original multi-container experiment. The desktop app
+does not call them, does not require calibration, and does not consume their data.
+
 This experiment measures a **synthetic foreground workload** in Linux containers.
 On Docker Desktop for macOS, the containers run inside Docker's Linux VM.
 The controller affects only project-owned containers; it cannot schedule native

@@ -18,10 +18,12 @@ from adaptive_os.workloads import TrialConfig, WORKLOAD_IMAGE, WorkloadProfile, 
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Synthetic Docker CPU-share experiment")
+    parser = argparse.ArgumentParser(description="Native desktop playground and legacy CPU-share experiments")
     commands = parser.add_subparsers(dest="command", required=True)
+    desktop = commands.add_parser('desktop', help='launch the native single-sandbox desktop app')
+    desktop.add_argument('--data-dir', type=Path)
     for command in ("preflight", "calibrate", "run", "report", "cleanup"):
-        subparser = commands.add_parser(command)
+        subparser = commands.add_parser(command, help='legacy multi-container benchmark workflow')
         subparser.add_argument("--runs-dir", type=Path, default=Path("runs"))
         if command == "cleanup":
             subparser.add_argument("--run-id", help="exact run UUID to restore and remove; omit to list only")
@@ -134,6 +136,13 @@ def run_baselines(runtime, args, stop):
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == 'desktop':
+        try:
+            from adaptive_os.desktop import main as desktop_main
+        except ImportError:
+            print('Install desktop support: python -m pip install -e ".[desktop]"', file=sys.stderr)
+            return 1
+        return desktop_main(['--data-dir', str(args.data_dir)] if args.data_dir else [])
     runtime = DockerRuntime()
     try:
         if args.command == "preflight":
