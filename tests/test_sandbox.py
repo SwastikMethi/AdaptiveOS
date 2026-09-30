@@ -10,11 +10,25 @@ import uuid
 
 from adaptive_os.sandbox.protocol import validate_command, validate_config
 from adaptive_os.sandbox.agent import read_process, cpu_percent, latency_window
+from adaptive_os.sandbox import presets
 from adaptive_os.sandbox_runtime import SandboxRuntime, LABELS
 from adaptive_os.docker_runtime import DockerError
 
 
 class SandboxTest(unittest.TestCase):
+    def test_file_io_step_reports_progress_before_full_scratch_pass(self):
+        with tempfile.TemporaryFile() as scratch:
+            self.assertTrue(hasattr(presets, 'io_step'), 'I/O must yield telemetry between bounded chunks')
+            state = (True, 0)
+            units = 0
+            for _ in range(128):
+                amount, state = presets.io_step(scratch, bytes(1024 * 1024), state)
+                self.assertEqual(amount, 1024 * 1024)
+                units += amount
+            self.assertEqual(units, 128 * 1024 * 1024)
+            self.assertEqual(scratch.seek(0, 2), 64 * 1024 * 1024)
+            self.assertEqual(state, (True, 0))
+
     def test_protocol_rejects_untrusted_commands_and_unbounded_resources(self):
         for preset, config in [('shell', {}), ('memory', {'mib': 129}),
                                ('memory', {'mib': True}), ('periodic', {'budget_ms': float('nan')}),

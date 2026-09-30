@@ -9,6 +9,7 @@ import time
 import uuid
 
 from adaptive_os.sandbox_runtime import SandboxRuntime, LABELS
+from adaptive_os.session_store import SessionStore
 
 
 def main():
@@ -24,6 +25,9 @@ def main():
     samples = {}
     last_heartbeat = 0
     closed = False
+    output = Path('build/verification') / session_id
+    store = SessionStore(output / 'sessions-v2.sqlite3')
+    store.begin(session_id, {'verification': True})
     print('Verification session:', session_id, flush=True)
 
     def pump(seconds, heartbeat=True):
@@ -35,7 +39,8 @@ def main():
                 last_heartbeat = time.monotonic()
             item = runtime.poll_message(.1)
             if item:
-                message, _ = item
+                message, receipt_ns = item
+                store.record(session_id, message, receipt_ns)
                 counts[message['kind']] += 1
                 if message['kind'] == 'ack':
                     acks[message['request_id']] = message
@@ -44,9 +49,11 @@ def main():
                 if message['kind'] == 'closed':
                     closed = True
                     return
+            store.flush()
 
     def command(op, ok=True, **fields):
         request = runtime.command(op, **fields)
+        store.record(session_id, {'kind': 'control', 'command': request}, time.monotonic_ns())
         deadline = time.monotonic() + 5
         while request['request_id'] not in acks and time.monotonic() < deadline:
             pump(.1)
@@ -58,8 +65,11 @@ def main():
         runtime.prepare(lambda line: print(line, flush=True))
         runtime.start(session_id)
         print(json.dumps(runtime.ready, indent=2), flush=True)
+        store.record(session_id, runtime.ready, runtime.ready['receipt_ns'])
         ids = [str(uuid.uuid4()) for _ in range(args.workloads)]
         presets = ['periodic', 'cpu'] if args.workloads == 2 else ['periodic', 'cpu', 'memory', 'io'] * 2
+        for i, p in zip(ids, presets):
+            store.configure(session_id, {'id': i, 'name': p, 'preset': p, 'config': {}})
         children = [command('start', workload_id=i, preset=p, config={}) for i, p in zip(ids, presets)]
         container_ids = runtime._run(['ps', '-q', '--no-trunc', '--filter', f'label=session_id={session_id}']).splitlines()
         assert container_ids == [runtime.container_id], container_ids
@@ -88,6 +98,10 @@ def main():
         assert set(samples) == set(ids), samples
         assert all(sample['rss_mib'] > 0 for sample in samples.values()), samples
         assert all(sample['app_rate'] is not None for sample in samples.values()), samples
+        if args.workloads == 8:
+            sizes = json.loads(runtime._run(['exec', runtime.container_id, 'python', '-c',
+                'import pathlib,json; print(json.dumps([p.stat().st_size for p in pathlib.Path("/scratch").glob("*.bin")]))']))
+            assert len(sizes) == 2 and all(size <= 64 * 1024 ** 2 for size in sizes), sizes
         command('stop', workload_id=ids[0])
         pump(2)
         command('priority', ok=False, workload_id=ids[0], nice=10)
@@ -98,6 +112,12 @@ def main():
         else:
             command('shutdown')
         print('PASS:', dict(counts), flush=True)
+        store.finish(session_id, 'completed')
+        store.export(session_id, output / 'recording.json', 'json')
+        store.export(session_id, output / 'recording.csv', 'csv')
+        recorded = json.loads((output / 'recording.json').read_text())
+        assert sum(m['kind'] == 'sample' for m in recorded['messages']) == counts['sample']
+        print('Recording/export verified:', output, flush=True)
     finally:
         try:
             runtime.cleanup_session(session_id)
@@ -105,6 +125,7 @@ def main():
             runtime.close_transport()
         assert not [s for s in runtime.leftovers() if s['session_id'] == session_id]
         print('Owned container and volume removed.', flush=True)
+        store.close()
 
 
 if __name__ == '__main__':

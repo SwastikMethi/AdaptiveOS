@@ -10,6 +10,25 @@ import time
 from .protocol import encode, identifier, validate_config
 
 
+def io_step(file, block, state):
+    writing, offset = state
+    if writing:
+        amount = file.write(block)
+        if amount != len(block):
+            raise OSError('Incomplete scratch write')
+    else:
+        amount = len(file.read(len(block)))
+        if amount != len(block):
+            raise OSError('Incomplete scratch read')
+    offset += 1
+    if offset == 64:
+        if writing:
+            os.fsync(file.fileno())
+        file.seek(0)
+        writing, offset = not writing, 0
+    return amount, (writing, offset)
+
+
 def run(preset, config, workload_id, cpu):
     os.sched_setaffinity(0, {cpu})
     start = last = time.monotonic_ns()
@@ -21,6 +40,7 @@ def run(preset, config, workload_id, cpu):
     block = bytes(1024 * 1024) if preset == 'io' else None
     scratch = Path('/scratch') / (workload_id + '.bin')
     file = scratch.open('w+b', buffering=0) if preset == 'io' else None
+    io_state = (True, 0)
     try:
         while True:
             if preset == 'periodic':
@@ -49,16 +69,8 @@ def run(preset, config, workload_id, cpu):
                     buffer[offset] = (buffer[offset] + 1) & 255
                 units += len(buffer) // 4096
             else:
-                file.seek(0)
-                for _ in range(64):
-                    written = file.write(block)
-                    if written != len(block):
-                        raise OSError('Incomplete scratch write')
-                    units += written
-                os.fsync(file.fileno())
-                file.seek(0)
-                while chunk := file.read(len(block)):
-                    units += len(chunk)
+                amount, io_state = io_step(file, block, io_state)
+                units += amount
             now = time.monotonic_ns()
             if now - last >= 1_000_000_000 or len(ticks) >= 200:
                 print(encode({'sequence': sequence, 'start_ns': start, 'mono_ns': now,

@@ -169,6 +169,11 @@ class Supervisor:
                     command['preset'], json.dumps(command['config']), workload_id, str(self.cpu)],
                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, process_group=0)
                 try:
+                    # Set and verify before acknowledging; child Python startup can
+                    # otherwise briefly inherit the collector's CPU affinity.
+                    os.sched_setaffinity(process.pid, {self.cpu})
+                    if os.sched_getaffinity(process.pid) != {self.cpu}:
+                        raise OSError('Workload CPU affinity readback did not match')
                     current = read_process(process.pid)
                     if not current:
                         raise ValueError('Workload exited before its identity could be read')
@@ -264,6 +269,8 @@ class Supervisor:
             now = current['mono_ns']
             rate = None
             progress, prior = child.progress, child.prior_progress
+            if progress and prior is None:
+                prior = {'mono_ns': progress['start_ns'], 'units': 0}
             fresh = bool(progress and 0 <= now - progress['mono_ns'] < 3_000_000_000)
             if fresh and prior:
                 elapsed = progress['mono_ns'] - prior['mono_ns']
