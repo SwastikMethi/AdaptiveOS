@@ -1,6 +1,7 @@
 """Protocol boundaries, process identity, and scoped Docker ownership."""
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -11,11 +12,37 @@ import uuid
 from adaptive_os.sandbox.protocol import validate_command, validate_config
 from adaptive_os.sandbox.agent import read_process, cpu_percent, latency_window
 from adaptive_os.sandbox import presets
+from adaptive_os.sandbox import agent
 from adaptive_os.sandbox_runtime import SandboxRuntime, LABELS
 from adaptive_os.docker_runtime import DockerError
 
 
 class SandboxTest(unittest.TestCase):
+    def test_full_output_pipe_does_not_block_the_heartbeat_loop(self):
+        reader, writer = os.pipe()
+        try:
+            os.set_blocking(writer, False)
+            while True:
+                try:
+                    os.write(writer, bytes(4096))
+                except BlockingIOError:
+                    break
+            self.assertTrue(hasattr(agent, 'flush_output'), 'Supervisor output must be nonblocking')
+            buffer = bytearray(b'telemetry\n')
+            agent.flush_output(buffer, writer)
+            self.assertEqual(buffer, bytearray(b'telemetry\n'))
+            os.read(reader, 4096)
+            agent.flush_output(buffer, writer)
+            self.assertEqual(buffer, bytearray())
+        finally:
+            os.close(reader)
+            os.close(writer)
+
+    def test_incomplete_latency_window_stays_unknown(self):
+        tick = {'scheduled_ns': 5_000_000_000, 'wakeup_ns': 5_000_000_000,
+                'completion_ns': 5_001_000_000, 'deadline_ns': 5_020_000_000, 'skipped': False}
+        self.assertIsNone(latency_window([tick], 0, 10_000_000_000)['miss_rate'])
+
     def test_file_io_step_reports_progress_before_full_scratch_pass(self):
         with tempfile.TemporaryFile() as scratch:
             self.assertTrue(hasattr(presets, 'io_step'), 'I/O must yield telemetry between bounded chunks')
@@ -70,9 +97,9 @@ class SandboxTest(unittest.TestCase):
             self.assertIsNone(read_process(123, Path(root)))
 
     def test_latency_uses_five_second_window_after_warmup(self):
-        ticks = [{'scheduled_ns': n * 1_000_000_000, 'deadline_ns': n * 1_000_000_000 + 20_000_000,
-                  'wakeup_ns': n * 1_000_000_000 + 2_000_000,
-                  'completion_ns': n * 1_000_000_000 + 21_000_000, 'skipped': False} for n in range(5, 10)]
+        ticks = [{'scheduled_ns': n * 20_000_000, 'deadline_ns': n * 20_000_000 + 20_000_000,
+                  'wakeup_ns': n * 20_000_000 + 2_000_000,
+                  'completion_ns': n * 20_000_000 + 21_000_000, 'skipped': False} for n in range(250, 500)]
         self.assertIsNone(latency_window(ticks, 0, 4_000_000_000)['miss_rate'])
         value = latency_window(ticks, 0, 10_000_000_000)
         self.assertEqual(value['miss_rate'], 1)

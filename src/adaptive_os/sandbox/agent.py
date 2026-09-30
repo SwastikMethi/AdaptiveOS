@@ -15,6 +15,15 @@ import time
 from .protocol import MAX_WORKLOADS, VERSION, encode, validate_command
 
 
+def flush_output(buffer, fd=1):
+    if buffer:
+        try:
+            written = os.write(fd, buffer)
+            del buffer[:written]
+        except BlockingIOError:
+            pass
+
+
 def read_process(pid, root=Path('/proc'), ticks_per_second=None):
     try:
         # comm may contain spaces and ')'; numeric fields follow its last ')'.
@@ -53,9 +62,17 @@ def latency_window(ticks, start_ns, now_ns):
     result = dict(miss_rate=None, p95_lateness_ms=None, p95_wakeup_ms=None)
     if now_ns - start_ns < 10_000_000_000:
         return result
-    ticks = [t for t in ticks if now_ns - 5_000_000_000 <= t['scheduled_ns'] < now_ns
-             and t['scheduled_ns'] >= start_ns + 5_000_000_000]
-    if ticks:
+    if not ticks:
+        return result
+    # Last fully delivered fixed 5-second window, not a partial rolling window
+    # ending at collection time (child reports can trail by a second).
+    available_end = min(now_ns, ticks[-1]['deadline_ns'])
+    window_end = start_ns + ((available_end - start_ns) // 5_000_000_000) * 5_000_000_000
+    if window_end < start_ns + 10_000_000_000 or now_ns - window_end > 8_000_000_000:
+        return result
+    ticks = [t for t in ticks if window_end - 5_000_000_000 <= t['scheduled_ns'] < window_end]
+    expected = list(range(window_end - 5_000_000_000, window_end, 20_000_000))
+    if [t['scheduled_ns'] for t in ticks] == expected:
         lateness = [max(0, t['completion_ns'] - t['deadline_ns']) / 1e6 for t in ticks]
         wakeup = [max(0, t['wakeup_ns'] - t['scheduled_ns']) / 1e6 for t in ticks]
         rank = math.ceil(.95 * len(ticks)) - 1
@@ -83,6 +100,8 @@ class Supervisor:
         self.buffers = {}
         self.children = {}
         self.sequence = 0
+        self.output = bytearray()
+        os.set_blocking(sys.stdout.fileno(), False)
         self.last_heartbeat = time.monotonic()
         self.stopping = False
         self.allowed_cpus = sorted(os.sched_getaffinity(0))
@@ -92,8 +111,11 @@ class Supervisor:
         os.sched_setaffinity(0, {self.collector_cpu})
 
     def emit(self, kind, **fields):
-        print(encode({'v': VERSION, 'sequence': self.sequence, 'mono_ns': time.monotonic_ns(),
-                      'kind': kind, **fields}).rstrip(), flush=True)
+        self.output.extend(encode({'v': VERSION, 'sequence': self.sequence, 'mono_ns': time.monotonic_ns(),
+                                   'kind': kind, **fields}).encode())
+        if len(self.output) > 1024 * 1024:
+            raise RuntimeError('Output backpressure exceeded 1 MiB; stopping the sandbox')
+        flush_output(self.output)
         self.sequence += 1
 
     def probe_priority(self):
@@ -248,6 +270,7 @@ class Supervisor:
                         raise ValueError('Invalid periodic tick')
                 child.prior_progress = child.progress
                 child.progress = value
+                child.start_ns = value['start_ns']
                 child.ticks.extend(value['ticks'])
                 self.emit('raw', workload_id=workload_id, data=value)
             except (ValueError, KeyError, TypeError) as exc:
@@ -298,6 +321,7 @@ class Supervisor:
             while not self.stopping:
                 for key, _ in self.selector.select(.1):
                     self.read_stream(key)
+                flush_output(self.output)
                 now = time.monotonic()
                 if now - self.last_heartbeat > 10:
                     self.emit('event', message='Host heartbeat lease expired; stopping workloads')
@@ -312,6 +336,10 @@ class Supervisor:
                 except (OSError, ValueError) as exc:
                     print(str(exc), file=sys.stderr)
             self.emit('closed')
+            deadline = time.monotonic() + 1
+            while self.output and time.monotonic() < deadline:
+                flush_output(self.output)
+                time.sleep(.01)
             self.selector.close()
 
 

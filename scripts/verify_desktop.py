@@ -23,6 +23,7 @@ def main():
     counts = Counter()
     acks = {}
     samples = {}
+    observed_rates = set()
     last_heartbeat = 0
     closed = False
     output = Path('build/verification') / session_id
@@ -46,6 +47,8 @@ def main():
                     acks[message['request_id']] = message
                 if message['kind'] == 'sample':
                     samples[message['workload_id']] = message
+                    if message.get('app_rate') is not None:
+                        observed_rates.add(message['workload_id'])
                 if message['kind'] == 'closed':
                     closed = True
                     return
@@ -97,7 +100,10 @@ def main():
                               'host_maxrss': resource.getrusage(resource.RUSAGE_SELF).ru_maxrss}), flush=True)
         assert set(samples) == set(ids), samples
         assert all(sample['rss_mib'] > 0 for sample in samples.values()), samples
-        assert all(sample['app_rate'] is not None for sample in samples.values()), samples
+        deadline = time.monotonic() + 90
+        while not set(ids).issubset(observed_rates) and time.monotonic() < deadline:
+            pump(1)
+        assert set(ids).issubset(observed_rates), 'No application progress within the bounded startup allowance'
         if args.workloads == 8:
             sizes = json.loads(runtime._run(['exec', runtime.container_id, 'python', '-c',
                 'import pathlib,json; print(json.dumps([p.stat().st_size for p in pathlib.Path("/scratch").glob("*.bin")]))']))
@@ -106,6 +112,16 @@ def main():
         pump(2)
         command('priority', ok=False, workload_id=ids[0], nice=10)
         assert samples[ids[1]]['mono_ns'] > samples[ids[0]]['mono_ns']
+        if args.workloads == 8:
+            for remaining_id in ids[1:]:
+                command('stop', workload_id=remaining_id)
+            memory_ids = [str(uuid.uuid4()) for _ in range(4)]
+            for memory_id in memory_ids:
+                command('start', workload_id=memory_id, preset='memory', config={'mib': 128})
+            command('start', ok=False, workload_id=str(uuid.uuid4()), preset='memory', config={'mib': 128})
+            for memory_id in memory_ids:
+                command('stop', workload_id=memory_id)
+            command('start', workload_id=str(uuid.uuid4()), preset='cpu', config={})
         if args.lease:
             pump(13, heartbeat=False)
             assert closed, 'Supervisor did not close on heartbeat lease expiry'

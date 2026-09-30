@@ -61,3 +61,9 @@ Once M1 passes, resume Task 7 (deterministic policy), then Task 8 (controller), 
 20. Kept prior-image evidence separate from current-image qualification. Cost if wrong: additional calibration time.
 
 The full task ledger remains in `.superpowers/sdd/2026-09-29-adaptive-os-controller-mvp/progress.md` for resumption. It is retained because the overall implementation plan is unfinished.
+# Desktop app update (2026-09-30)
+
+The native single-container playground is now implemented separately from this
+legacy benchmark. See [desktop verification](desktop-verification.md) for the
+current app's evidence and limitations, and the README for launch/build commands.
+The legacy calibration gate below does not block desktop monitoring.
