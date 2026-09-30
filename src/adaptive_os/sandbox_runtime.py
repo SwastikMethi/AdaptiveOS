@@ -236,11 +236,11 @@ class SandboxRuntime(DockerRuntime):
         return command
 
     def poll_message(self, timeout=0):
-        if self.stream_error:
-            raise DockerError(self.stream_error)
         try:
             return self.messages.get(timeout=timeout)
         except queue.Empty:
+            if self.stream_error:
+                raise DockerError(self.stream_error)
             return None
 
     def inspect_volume(self, name, session_id):

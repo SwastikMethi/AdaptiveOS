@@ -87,6 +87,7 @@ class MainWindow(QMainWindow):
         self.priority_supported = False
         self.session_id = None
         self.history_mode = False
+        self.workload_offset = self.workload_total = 0
         self.origin_ns = None
         self.closing = False
         self.last_worker_error = None
@@ -134,9 +135,21 @@ class MainWindow(QMainWindow):
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 8, 0)
+        self.workload_pager = QWidget()
+        pages = QHBoxLayout(self.workload_pager)
+        pages.setContentsMargins(0, 0, 0, 0)
+        self.workload_previous = self.button(pages, 'Previous workloads', lambda: self.history_page(-1))
+        self.workload_page_label = QLabel()
+        pages.addWidget(self.workload_page_label)
+        self.workload_next = self.button(pages, 'Next workloads', lambda: self.history_page(1))
+        pages.addStretch()
+        self.workload_pager.hide()
+        left_layout.addWidget(self.workload_pager)
         self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(['Workload', 'Preset', 'State', 'CPU %', 'RSS MiB', 'Throughput', 'Priority'])
-        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        # Qt Cocoa 6.11's selected-row accessibility traversal can invalidate
+        # sibling cell interfaces. One selected cell still identifies a workload.
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.verticalHeader().hide()
@@ -213,7 +226,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f'Recordings: {worker.database}  |  Observational playground, not a causal benchmark')
         self.add_workload(workload('periodic'))
         self.add_workload(workload('cpu'))
-        self.table.selectRow(0)
+        self.table.setCurrentCell(0, 0)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.pump)
         self.timer.start(100)
@@ -275,7 +288,7 @@ class MainWindow(QMainWindow):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             try:
                 self.add_workload(dialog.result_workload())
-                self.table.selectRow(len(self.workloads) - 1)
+                self.table.setCurrentCell(len(self.workloads) - 1, 0)
             except ValueError as exc:
                 self.status.setText(str(exc))
         self.update_controls()
@@ -309,7 +322,7 @@ class MainWindow(QMainWindow):
                 chart.color_indexes[key] = index
         self.table.resizeColumnsToContents()
         if selected in self.workloads and self.table.currentRow() != list(self.workloads).index(selected):
-            self.table.selectRow(list(self.workloads).index(selected))
+            self.table.setCurrentCell(list(self.workloads).index(selected), 0)
         self.table.blockSignals(False)
 
     def show_details(self, reset_fields=True):
@@ -351,6 +364,8 @@ class MainWindow(QMainWindow):
         self.stop_all_button.setEnabled(editable and self.active)
         for button in (self.history_refresh, self.history_open, self.json_export, self.csv_export, self.new_session):
             button.setEnabled(not self.active and not self.busy and not self.closing)
+        self.workload_previous.setEnabled(self.history_mode and not self.busy and self.workload_offset > 0)
+        self.workload_next.setEnabled(self.history_mode and not self.busy and self.workload_offset + MAX_WORKLOADS < self.workload_total)
         key = self.selected_id()
         row = self.workloads.get(key)
         waiting = any(p.get('workload_id') == key for p in self.pending.values())
@@ -395,7 +410,7 @@ class MainWindow(QMainWindow):
                 chart.update()
             self.refresh_table()
             if self.workloads:
-                self.table.selectRow(0)
+                self.table.setCurrentCell(0, 0)
             self.update_controls()
 
     def start_session(self):
@@ -597,6 +612,11 @@ class MainWindow(QMainWindow):
         if not self.active and not self.busy and (session_id := self.history_id()):
             self.action('load', session_id=session_id)
 
+    def history_page(self, delta):
+        if self.history_mode and not self.active and not self.busy:
+            self.action('load', session_id=self.session_id,
+                        workload_offset=max(0, self.workload_offset + delta * MAX_WORKLOADS))
+
     def export(self, format):
         session_id = self.history_id()
         if not session_id or self.active or self.busy:
@@ -618,6 +638,11 @@ class MainWindow(QMainWindow):
         self.busy = False
         self.history_mode = True
         self.session_id = recording['session']['id']
+        self.workload_offset = recording.get('workload_offset', 0)
+        self.workload_total = recording.get('workload_total', len(recording['workloads']))
+        self.workload_pager.setVisible(self.workload_total > MAX_WORKLOADS)
+        self.workload_page_label.setText(f'Workloads {self.workload_offset + 1}–'
+            f'{min(self.workload_offset + MAX_WORKLOADS, self.workload_total)} of {self.workload_total}')
         self.workloads.clear()
         self.clear_charts()
         self.events.clear()
@@ -638,7 +663,7 @@ class MainWindow(QMainWindow):
         self.status.setText(f'Recording {self.session_id[:8]} • {recording["session"]["status"]} • read-only, up to 300 observed points per workload. Export for full resolution.')
         self.refresh_table()
         if self.workloads:
-            self.table.selectRow(0)
+            self.table.setCurrentCell(0, 0)
             self.show_details()
         self.tabs.setCurrentIndex(0)
 
@@ -646,12 +671,13 @@ class MainWindow(QMainWindow):
         if self.active:
             return
         self.history_mode = False
+        self.workload_pager.hide()
         self.workloads.clear()
         self.pending.clear()
         self.clear_charts()
         self.add_workload(workload('periodic'))
         self.add_workload(workload('cpu'))
-        self.table.selectRow(0)
+        self.table.setCurrentCell(0, 0)
         self.status.setText('New playground ready. Start sandbox when Docker Desktop is running.')
         self.tabs.setCurrentIndex(0)
         self.update_controls()

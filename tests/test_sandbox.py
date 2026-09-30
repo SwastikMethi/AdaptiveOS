@@ -18,6 +18,15 @@ from adaptive_os.docker_runtime import DockerError
 
 
 class SandboxTest(unittest.TestCase):
+    def test_terminal_stream_error_follows_already_queued_evidence(self):
+        runtime = SandboxRuntime(docker='docker')
+        envelope = ({'kind': 'closed', 'sequence': 3, 'mono_ns': 100}, 200)
+        runtime.messages.put(envelope)
+        runtime.stream_error = 'invalid trailing output'
+        self.assertEqual(runtime.poll_message(), envelope)
+        with self.assertRaisesRegex(DockerError, 'invalid trailing output'):
+            runtime.poll_message()
+
     def test_full_output_pipe_does_not_block_the_heartbeat_loop(self):
         reader, writer = os.pipe()
         try:

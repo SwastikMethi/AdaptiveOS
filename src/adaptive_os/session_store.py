@@ -8,7 +8,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 
-from .sandbox.protocol import identifier, validate_config
+from .sandbox.protocol import MAX_WORKLOADS, identifier, validate_config
 
 
 def utc_now():
@@ -89,26 +89,32 @@ class SessionStore:
             raise ValueError('Recording not found')
         return {**dict(row), 'metadata': json.loads(row['metadata'])}
 
-    def workloads(self, session_id):
+    def workloads(self, session_id, limit=-1, offset=0):
         return [{**dict(row), 'config': json.loads(row['config'])} for row in self.db.execute(
-            'SELECT * FROM workloads WHERE session_id=? ORDER BY rowid', (session_id,))]
+            'SELECT * FROM workloads WHERE session_id=? ORDER BY rowid LIMIT ? OFFSET ?', (session_id, limit, offset))]
 
-    def load(self, session_id):
+    def load(self, session_id, workload_offset=0):
         session = self.session(session_id)
+        if type(workload_offset) is not int or workload_offset < 0:
+            raise ValueError('Invalid workload page')
+        total = self.db.execute('SELECT count(*) FROM workloads WHERE session_id=?', (session_id,)).fetchone()[0]
+        workload_offset = min(workload_offset, max(0, (total - 1) // MAX_WORKLOADS * MAX_WORKLOADS))
         # Select at most 300 evenly spaced observed points per workload, including
         # the final sample. Raw/full-resolution data remain in messages/exports.
         samples = [json.loads(row[0]) for row in self.db.execute('''
-            WITH ranked AS (
+            WITH page AS (SELECT id FROM workloads WHERE session_id=? ORDER BY rowid LIMIT ? OFFSET ?),
+            ranked AS (
                 SELECT payload,mono_ns,
                   row_number() OVER (PARTITION BY workload_id ORDER BY mono_ns DESC) AS n,
                   count(*) OVER (PARTITION BY workload_id) AS total
-                FROM messages WHERE session_id=? AND kind='sample')
+                FROM messages WHERE session_id=? AND kind='sample' AND workload_id IN (SELECT id FROM page))
             SELECT payload FROM ranked WHERE (n-1) % max(1, (total+299)/300)=0 ORDER BY mono_ns
-        ''', (session_id,))]
+        ''', (session_id, MAX_WORKLOADS, workload_offset, session_id))]
         events = [json.loads(row[0]) for row in self.db.execute(
             "SELECT payload FROM (SELECT id,payload FROM messages WHERE session_id=? "
             "AND kind NOT IN ('sample','raw') ORDER BY id DESC LIMIT 500) ORDER BY id", (session_id,))]
-        return {'session': session, 'workloads': self.workloads(session_id), 'samples': samples, 'events': events}
+        return {'session': session, 'workloads': self.workloads(session_id, MAX_WORKLOADS, workload_offset),
+                'workload_offset': workload_offset, 'workload_total': total, 'samples': samples, 'events': events}
 
     def export(self, session_id, path, format):
         if format not in ('json', 'csv'):

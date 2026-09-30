@@ -6,6 +6,7 @@ import queue
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 try:
     from PySide6.QtWidgets import QApplication
@@ -27,6 +28,9 @@ class DesktopTest(unittest.TestCase):
             worker = SessionWorker(Path(root) / 'sessions.sqlite3')
             window = MainWindow(worker)
             self.assertEqual([row['preset'] for row in window.workloads.values()], ['periodic', 'cpu'])
+            # Qt Cocoa 6.11 can invalidate sibling interfaces while enumerating
+            # an entire selected row. Keep one accessible cell selected.
+            self.assertEqual(len(window.table.selectedItems()), 1)
             self.assertEqual(build_parser().parse_args(['desktop']).command, 'desktop')
             workload_id = next(iter(window.workloads))
             row = window.workloads[workload_id]
@@ -141,6 +145,91 @@ class DesktopTest(unittest.TestCase):
                 worker.pump()
             self.assertEqual(worker.store.db.execute('select kind from messages').fetchone()[0], 'closed')
             worker.store.close()
+
+    def test_disconnected_shutdown_preserves_tail_and_reports_missing_close(self):
+        from adaptive_os.session_store import SessionStore
+        import uuid
+        class Disconnected:
+            diagnostics = ['attach exited']
+            process = None
+            cleaned = False
+            def __init__(self, closed, connected=False):
+                self.connected = connected
+                self.items = [({'kind': 'event', 'sequence': 1, 'mono_ns': 1,
+                                'message': 'heartbeat lease expired'}, 1)]
+                if closed:
+                    self.items.append(({'kind': 'closed', 'sequence': 2, 'mono_ns': 2}, 2))
+            def command(self, op):
+                if not self.connected:
+                    raise OSError('not connected')
+            def poll_message(self, timeout=0):
+                return self.items.pop(0) if self.items else None
+            def cleanup_session(self, session_id):
+                self.cleaned = True
+            def close_transport(self):
+                pass
+        for closed, connected in ((True, False), (False, False), (False, True)):
+            with self.subTest(closed=closed, connected=connected), tempfile.TemporaryDirectory() as root:
+                worker = SessionWorker(Path(root) / 'sessions.sqlite3')
+                worker.store = SessionStore(worker.database)
+                worker.session_id = str(uuid.uuid4())
+                worker.store.begin(worker.session_id, {})
+                worker.runtime, worker.active, worker.clock_anchor = Disconnected(closed, connected), True, (0, 0)
+                with patch('adaptive_os.desktop_worker.time.monotonic', side_effect=range(20)):
+                    with self.assertRaisesRegex(RuntimeError, 'closed acknowledgement' if connected else 'not connected'):
+                        worker.stop_session('completed')
+                messages = [dict(row) for row in worker.store.db.execute('select kind,payload from messages')]
+                self.assertEqual(messages[0]['kind'], 'event')
+                self.assertEqual(any(m['kind'] == 'closed' for m in messages), closed)
+                failures = [m['payload'] for m in messages if m['kind'] == 'failure']
+                self.assertTrue(any('attach exited' in m for m in failures))
+                if not connected:
+                    self.assertTrue(any('not connected' in m for m in failures))
+                if not closed:
+                    self.assertTrue(any('closed acknowledgement' in m for m in failures))
+                self.assertTrue(worker.runtime.cleaned)
+                self.assertEqual(worker.store.session(worker.session_id)['status'], 'failed')
+                stopped = [m for m in list(worker.updates.queue) if m['kind'] == 'stopped']
+                self.assertFalse(stopped[0]['clean'])
+                worker.store.close()
+
+    def test_history_pages_bound_rows_and_charts_after_workload_churn(self):
+        from adaptive_os.session_store import SessionStore
+        from adaptive_os.desktop import workload
+        import uuid
+        with tempfile.TemporaryDirectory() as root:
+            worker = SessionWorker(Path(root) / 'sessions.sqlite3')
+            store = SessionStore(worker.database)
+            session_id = str(uuid.uuid4())
+            store.begin(session_id, {})
+            for index in range(24):
+                row = workload('cpu', f'CPU {index}')
+                store.configure(session_id, row)
+                store.record(session_id, {'kind': 'sample', 'workload_id': row['id'],
+                             'sequence': index, 'mono_ns': index * 1_000_000_000,
+                             'cpu_pct': 50, 'nice': 0}, index)
+            window = MainWindow(worker)
+            window.load_recording(store.load(session_id))
+            self.assertEqual(window.table.rowCount(), 8)
+            self.assertEqual(len(window.cpu_chart.series), 8)
+            self.assertTrue(window.workload_next.isEnabled())
+            window.workload_next.click()
+            request = worker.requests.get_nowait()
+            self.assertEqual(request['workload_offset'], 8)
+            window.load_recording(store.load(session_id, workload_offset=8))
+            self.assertEqual([w['name'] for w in window.workloads.values()], [f'CPU {i}' for i in range(8, 16)])
+            self.assertEqual(len(window.cpu_chart.series), 8)
+            window.load_recording(store.load(session_id, workload_offset=16))
+            self.assertFalse(window.workload_next.isEnabled())
+            self.assertTrue(window.workload_previous.isEnabled())
+            export_path = Path(root) / 'all.json'
+            store.export(session_id, export_path, 'json')
+            import json
+            exported = json.loads(export_path.read_text())
+            self.assertEqual(len(exported['workloads']), 24)
+            self.assertEqual(len(exported['messages']), 24)
+            window.close()
+            store.close()
 
 
 if __name__ == '__main__':

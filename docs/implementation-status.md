@@ -1,4 +1,16 @@
-# Implementation status — 2026-09-29
+# Desktop app update — 2026-09-30
+
+The native single-container playground is implemented on `feat/adaptive-os-mvp`.
+It runs 2–8 competing workload processes in one Linux sandbox, with native Qt
+controls, live telemetry, saved recordings and JSON/CSV export. The local macOS
+bundle is `dist/Adaptive OS Controller.app`; Docker Desktop must be running.
+
+See [desktop verification](desktop-verification.md) for the 55-test suite,
+eight-workload integration checks, ten-minute soak, native walkthrough, review
+fixes and remaining limitations. The legacy calibration gate below does not
+block desktop monitoring. No automatic policy/model controller is claimed.
+
+# Legacy benchmark implementation status — 2026-09-29
 
 Implemented on `feat/adaptive-os-mvp`: plan Tasks 1–6 (M0 and the M1 baseline/calibration tooling). M0 passed on this machine. The M1 **experiment gate has not passed reproducibly**, so Tasks 7–11 remain pending. This is not a policy-comparison result.
 
@@ -61,9 +73,3 @@ Once M1 passes, resume Task 7 (deterministic policy), then Task 8 (controller), 
 20. Kept prior-image evidence separate from current-image qualification. Cost if wrong: additional calibration time.
 
 The full task ledger remains in `.superpowers/sdd/2026-09-29-adaptive-os-controller-mvp/progress.md` for resumption. It is retained because the overall implementation plan is unfinished.
-# Desktop app update (2026-09-30)
-
-The native single-container playground is now implemented separately from this
-legacy benchmark. See [desktop verification](desktop-verification.md) for the
-current app's evidence and limitations, and the README for launch/build commands.
-The legacy calibration gate below does not block desktop monitoring.

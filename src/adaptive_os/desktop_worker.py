@@ -27,6 +27,7 @@ class SessionWorker(threading.Thread):
         self.error = None
         self.last_heartbeat = self.last_flush = 0
         self.clock_anchor = None
+        self.closed = False
 
     def submit(self, request):
         self.requests.put_nowait(request)
@@ -122,6 +123,7 @@ class SessionWorker(threading.Thread):
             try:
                 runtime.start(self.session_id)
                 self.active = True
+                self.closed = False
                 self.pending.clear()
                 ready = runtime.ready
                 self.clock_anchor = (ready['mono_ns'], ready['receipt_ns'])
@@ -150,7 +152,7 @@ class SessionWorker(threading.Thread):
         elif op == 'history':
             self.refresh_history()
         elif op == 'load':
-            self.emit('loaded', recording=self.store.load(request['session_id']))
+            self.emit('loaded', recording=self.store.load(request['session_id'], request.get('workload_offset', 0)))
         elif op == 'export':
             self.store.export(request['session_id'], request['path'], request['format'])
             self.emit('exported', path=str(request['path']))
@@ -166,6 +168,8 @@ class SessionWorker(threading.Thread):
     def receive(self, item):
         message, receipt_ns = item
         self.store.record(self.session_id, message, receipt_ns)
+        if message['kind'] == 'closed':
+            self.closed = True
         if message['kind'] == 'ack':
             self.pending.pop(message['request_id'], None)
         if message['kind'] != 'raw':
@@ -200,27 +204,40 @@ class SessionWorker(threading.Thread):
         if not self.active:
             return
         errors = []
-        closed = False
         try:
-            self.runtime.command('shutdown')
+            try:
+                self.runtime.command('shutdown')
+            except Exception as exc:
+                errors.append(str(exc))
+            # An exited attach process may still have valid evidence queued by its
+            # reader. A failed send must not skip that evidence (especially closed).
             deadline = time.monotonic() + 4
-            while time.monotonic() < deadline:
+            while not self.closed and time.monotonic() < deadline:
                 item = self.runtime.poll_message(.1)
-                if item and self.receive(item) == 'closed':
-                    closed = True
-                    break
+                if item:
+                    self.receive(item)
         except Exception as exc:
             errors.append(str(exc))
         finally:
+            if not self.closed:
+                errors.append('Sandbox closed acknowledgement was not received')
             try:
                 self.runtime.cleanup_session(self.session_id)
             except Exception as exc:
                 errors.append(str(exc))
-            self.runtime.close_transport()
+            transport_exit = self.runtime.process.poll() if getattr(self.runtime, 'process', None) else None
+            try:
+                self.runtime.close_transport()
+            except Exception as exc:
+                errors.append(str(exc))
             self.active = False
             self.pending.clear()
             try:
-                self.store.finish(self.session_id, status if closed and not errors else 'failed')
+                if errors:
+                    self.store.record(self.session_id, {'kind': 'failure', 'message': '; '.join(errors),
+                        'diagnostics': list(getattr(self.runtime, 'diagnostics', [])),
+                        'transport_exit': transport_exit}, time.monotonic_ns())
+                self.store.finish(self.session_id, status if not errors else 'failed')
             except Exception as exc:
                 errors.append(f'Recording write failed: {exc}')
             self.emit('stopped', session_id=self.session_id, clean=not errors)

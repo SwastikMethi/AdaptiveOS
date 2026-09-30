@@ -51,6 +51,7 @@ class SessionStoreTest(unittest.TestCase):
             session_id, workload_id = str(uuid.uuid4()), str(uuid.uuid4())
             store = SessionStore(path)
             store.begin(session_id, {})
+            store.configure(session_id, {'id': workload_id, 'name': 'CPU', 'preset': 'cpu', 'config': {}})
             for index in range(1000):
                 store.record(session_id, {'kind': 'sample', 'sequence': index,
                              'workload_id': workload_id, 'mono_ns': index * 1_000_000_000,
