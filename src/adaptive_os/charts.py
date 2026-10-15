@@ -19,6 +19,8 @@ class TimeSeriesChart(QWidget):
         self.color_indexes = {}
         self.window_seconds = 300
         self.gap_seconds = 2.5
+        self.markers = {}
+        self.selected_marker = None
         self.setMinimumHeight(160)
         self.setAccessibleName(f'{title} chart, {unit}; numeric values are in the workload table and details')
 
@@ -31,6 +33,18 @@ class TimeSeriesChart(QWidget):
 
     def clear(self):
         self.series.clear()
+        self.markers.clear()
+        self.selected_marker = None
+        self.update()
+
+    def visible_range(self):
+        end = max((point[0] for points in self.series.values() for point in points), default=0)
+        return max(0, end - self.window_seconds), end
+
+    def mark_acknowledgement(self, key, seconds, label):
+        self.markers[key] = (seconds, label)
+        if len(self.markers) > 100:
+            self.markers.pop(next(iter(self.markers)))
         self.update()
 
     def paintEvent(self, event):
@@ -57,6 +71,17 @@ class TimeSeriesChart(QWidget):
         painter.setPen(QColor('#64748b'))
         painter.drawText(int(plot.left()), int(plot.bottom() + 18), f'{start:.0f} s')
         painter.drawText(int(plot.right() - 52), int(plot.bottom() + 18), f'{end:.0f} s')
+        markers = [(seconds, label, False) for seconds, label in self.markers.values()]
+        if self.selected_marker:
+            markers.append((*self.selected_marker, True))
+        for seconds, label, selected in markers:
+            if start <= seconds <= end:
+                x = plot.left() + (seconds - start) / width * plot.width()
+                painter.setPen(QPen(QColor('#9b5300' if selected else '#94a3b8'), 2 if selected else 1,
+                                    Qt.PenStyle.DashLine))
+                painter.drawLine(QPointF(x, plot.top()), QPointF(x, plot.bottom()))
+                if selected:
+                    painter.drawText(int(min(x + 4, plot.right() - 180)), int(plot.top() + 14), label)
         for index, (key, points) in enumerate(self.series.items()):
             color = QColor(COLORS[self.color_indexes.get(key, index) % len(COLORS)])
             path = QPainterPath()

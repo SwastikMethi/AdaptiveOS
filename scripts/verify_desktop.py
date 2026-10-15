@@ -23,6 +23,7 @@ def main():
     counts = Counter()
     acks = {}
     samples = {}
+    probe_ids = set()
     observed_rates = set()
     last_heartbeat = 0
     closed = False
@@ -45,7 +46,7 @@ def main():
                 counts[message['kind']] += 1
                 if message['kind'] == 'ack':
                     acks[message['request_id']] = message
-                if message['kind'] == 'sample':
+                if message['kind'] == 'sample' and message['workload_id'] not in probe_ids:
                     samples[message['workload_id']] = message
                     if message.get('app_rate') is not None:
                         observed_rates.add(message['workload_id'])
@@ -69,6 +70,15 @@ def main():
         runtime.start(session_id)
         print(json.dumps(runtime.ready, indent=2), flush=True)
         store.record(session_id, runtime.ready, runtime.ready['receipt_ns'])
+        for original, lowered in ((0, 10), (10, 19)):
+            probe_id = str(uuid.uuid4())
+            probe_ids.add(probe_id)
+            probe = command('probe_start', workload_id=probe_id, nice=original)
+            command('priority', workload_id=probe_id, identity=probe['identity'], nice=lowered)
+            command('priority', workload_id=probe_id, identity=probe['identity'], nice=original)
+            command('probe_stop', workload_id=probe_id, identity=probe['identity'])
+        preflight = command('preflight_complete')
+        assert preflight['priority_supported']
         ids = [str(uuid.uuid4()) for _ in range(args.workloads)]
         presets = ['periodic', 'cpu'] if args.workloads == 2 else ['periodic', 'cpu', 'memory', 'io'] * 2
         for i, p in zip(ids, presets):
@@ -84,11 +94,11 @@ def main():
         pump(.2)
         affinity = json.loads(runtime._run(['exec', runtime.container_id, 'python', '-c', script]))
         assert affinity == [[runtime.ready['workload_cpu']]] * args.workloads, affinity
-        if runtime.ready['priority_supported']:
+        if preflight['priority_supported']:
             for nice in (10, 19, 0):
-                assert command('priority', workload_id=ids[0], nice=nice)['nice'] == nice
+                assert command('priority', workload_id=ids[0], identity=children[0]['identity'], nice=nice)['nice'] == nice
         else:
-            command('priority', ok=False, workload_id=ids[0], nice=10)
+            command('priority', ok=False, workload_id=ids[0], identity=children[0]['identity'], nice=10)
         if args.workloads == 8:
             command('start', ok=False, workload_id=str(uuid.uuid4()), preset='cpu', config={})
         remaining = args.seconds
@@ -110,7 +120,7 @@ def main():
             assert len(sizes) == 2 and all(size <= 64 * 1024 ** 2 for size in sizes), sizes
         command('stop', workload_id=ids[0])
         pump(2)
-        command('priority', ok=False, workload_id=ids[0], nice=10)
+        command('priority', ok=False, workload_id=ids[0], identity=children[0]['identity'], nice=10)
         assert samples[ids[1]]['mono_ns'] > samples[ids[0]]['mono_ns']
         if args.workloads == 8:
             for remaining_id in ids[1:]:

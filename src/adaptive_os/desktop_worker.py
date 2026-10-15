@@ -6,6 +6,7 @@ import threading
 import time
 import uuid
 
+from .macos_activity import SessionActivity
 from .sandbox.protocol import VERSION, validate_command
 from .sandbox_runtime import SandboxRuntime
 from .session_store import SessionStore
@@ -23,11 +24,17 @@ class SessionWorker(threading.Thread):
         self.session_id = None
         self.active = False
         self.pending = {}
+        self.pending_timeouts = {}
         self.quitting = False
         self.error = None
         self.last_heartbeat = self.last_flush = 0
+        self.last_pump = self.last_health = 0
+        self.flush_duration_ms = 0
         self.clock_anchor = None
         self.closed = False
+        self.preflight = None
+        self.workload_presets = {}
+        self.activity = SessionActivity()
 
     def submit(self, request):
         self.requests.put_nowait(request)
@@ -42,6 +49,101 @@ class SessionWorker(threading.Thread):
 
     def refresh_history(self):
         self.emit('history', sessions=self.store.sessions())
+
+    def send_control(self, command, workload=None):
+        command = validate_command(command)
+        if workload:
+            self.store.configure(self.session_id, workload)
+        self.store.record(self.session_id, {'kind': 'control', 'command': command}, time.monotonic_ns())
+        self.store.flush()
+        self.runtime.send(command)
+        self.pending[command['request_id']] = time.monotonic()
+        self.pending_timeouts[command['request_id']] = 30 if command['op'] == 'start' and command.get('preset') == 'cache' else 5
+
+    def preflight_send(self, stage, op, **fields):
+        command = {'v': VERSION, 'request_id': str(uuid.uuid4()), 'op': op, **fields}
+        self.preflight.update(stage=stage, expected=command)
+        self.send_control(command)
+
+    def begin_preflight(self):
+        self.preflight = {'sequences': [], 'transitions': []}
+        self.preflight_send('start0', 'probe_start', workload_id=str(uuid.uuid4()), nice=0)
+
+    def finish_preflight(self, passed, error=None):
+        evidence = {**self.preflight, 'passed': passed,
+                    'session_id': self.session_id, 'image_id': self.runtime.ready.get('image_id'),
+                    'resource_limits': self.runtime.ready.get('resource_limits')}
+        evidence.pop('expected', None)
+        if error:
+            evidence['error'] = error
+        message = {'kind': 'priority_preflight', 'passed': passed, 'evidence': evidence}
+        self.store.record(self.session_id, message, time.monotonic_ns())
+        self.store.flush()
+        self.emit('ack', op='priority_preflight', ok=passed, priority_supported=passed,
+                  priority_reason=('Reversible priority preflight passed through acknowledged control path'
+                                   if passed else f'Reversible priority preflight failed: {error}'),
+                  preflight=evidence, session_id=self.session_id)
+        self.preflight = None
+
+    def abort_preflight(self, error):
+        self.preflight['error'] = error
+        self.preflight_send('abort', 'preflight_abort')
+
+    def advance_preflight(self, message):
+        if not self.preflight:
+            return
+        expected, stage = self.preflight['expected'], self.preflight['stage']
+        if message.get('request_id') != expected['request_id']:
+            return
+        if not message.get('ok') or message.get('op') != expected['op']:
+            error = message.get('error', 'preflight acknowledgement did not match request')
+            if stage == 'abort':
+                self.finish_preflight(False, error)
+                raise RuntimeError('Preflight probe cleanup failed: ' + error)
+            self.abort_preflight(error)
+            return
+        if 'workload_id' in expected and message.get('workload_id') != expected['workload_id']:
+            error = 'preflight workload acknowledgement did not match'
+            self.abort_preflight(error)
+            return
+        if stage in ('start0', 'start10'):
+            if message.get('nice') != expected['nice'] or type(message.get('identity')) is not int:
+                error = 'preflight snapshot readback did not match'
+                self.abort_preflight(error)
+                return
+            self.preflight['sequences'].append({'workload_id': expected['workload_id'],
+                'identity': message['identity'], 'original_nice': message['nice']})
+            target = 10 if stage == 'start0' else 19
+            self.preflight_send('p0_10' if stage == 'start0' else 'p10_19', 'priority',
+                workload_id=expected['workload_id'], identity=message['identity'], nice=target)
+        elif stage in ('p0_10', 'p0_0', 'p10_19', 'p10_10'):
+            if message.get('nice') != expected['nice'] or message.get('identity') != expected['identity']:
+                error = 'preflight transition readback did not match'
+                self.abort_preflight(error)
+                return
+            sequence = self.preflight['sequences'][-1]
+            previous = sequence['original_nice'] if not sequence.get('steps') else sequence['steps'][-1]['to']
+            step = {'from': previous, 'to': message['nice'], 'actual': message['nice'],
+                    'identity': message['identity'], 'request_id': expected['request_id']}
+            sequence.setdefault('steps', []).append(step)
+            self.preflight['transitions'].append(step)
+            if stage == 'p0_10':
+                self.preflight_send('p0_0', 'priority', workload_id=expected['workload_id'],
+                                    identity=expected['identity'], nice=0)
+            elif stage == 'p10_19':
+                self.preflight_send('p10_10', 'priority', workload_id=expected['workload_id'],
+                                    identity=expected['identity'], nice=10)
+            else:
+                self.preflight_send('stop0' if stage == 'p0_0' else 'stop10', 'probe_stop',
+                                    workload_id=expected['workload_id'], identity=expected['identity'])
+        elif stage == 'stop0':
+            self.preflight_send('start10', 'probe_start', workload_id=str(uuid.uuid4()), nice=10)
+        elif stage == 'stop10':
+            self.preflight_send('complete', 'preflight_complete')
+        elif stage == 'complete':
+            self.finish_preflight(True)
+        elif stage == 'abort':
+            self.finish_preflight(False, self.preflight.get('error', 'preflight failed'))
 
     def run(self):
         try:
@@ -71,6 +173,8 @@ class SessionWorker(threading.Thread):
                     self.stop_session('interrupted')
             except Exception as exc:
                 self.error = f'Shutdown incomplete: {exc}. Recover this exact session on the next launch.'
+            finally:
+                self.activity.end()
             if self.runtime:
                 self.runtime.close_transport()
             if self.store:
@@ -119,8 +223,14 @@ class SessionWorker(threading.Thread):
             runtime.cancel.clear()
             runtime.prepare(lambda line: self.emit('build', message=line))
             self.session_id = str(uuid.uuid4())
-            self.store.begin(self.session_id, {'workloads': request['workloads']})
+            selected_resource = request.get('resource', 'cpu')
+            self.store.begin(self.session_id, {'workloads': request['workloads'], 'resource': selected_resource,
+                                               'link_mbps': request.get('link_mbps', 20)})
+            self.workload_presets = {row['id']: row['preset'] for row in request['workloads']}
             try:
+                self.activity.begin()
+                self.store.record(self.session_id, {'kind': 'host_activity', 'state': 'started',
+                    'app_nap_prevented': self.activity.active, 'idle_system_sleep_allowed': True}, time.monotonic_ns())
                 runtime.start(self.session_id)
                 self.active = True
                 self.closed = False
@@ -132,27 +242,49 @@ class SessionWorker(threading.Thread):
                     self.store.configure(self.session_id, workload)
                 self.store.flush()
                 self.emit('ready', **{k: v for k, v in ready.items() if k != 'kind'}, session_id=self.session_id)
+                if selected_resource == 'cpu':
+                    self.begin_preflight()
+                else:
+                    self.send_control({'v': VERSION, 'request_id': str(uuid.uuid4()), 'op': 'configure',
+                                       'resource': selected_resource, 'link_mbps': request.get('link_mbps', 20)})
                 self.last_heartbeat = 0
             except Exception:
-                self.store.finish(self.session_id, 'failed')
+                try:
+                    self.store.finish(self.session_id, 'failed')
+                finally:
+                    if not self.active:
+                        self.activity.end()
                 raise
         elif op == 'control':
             if not self.active:
                 raise ValueError('Start a sandbox first')
-            command = validate_command(request['command'])
-            if request.get('workload'):
-                self.store.configure(self.session_id, request['workload'])
-            self.store.record(self.session_id, {'kind': 'control', 'command': command}, time.monotonic_ns())
-            # Persist intent before its external side effect.
-            self.store.flush()
-            self.runtime.send(command)
-            self.pending[command['request_id']] = time.monotonic()
+            self.send_control(request['command'], request.get('workload'))
+        elif op == 'audit':
+            message = request.get('message')
+            if (not isinstance(message, dict) or message.get('kind') not in
+                    {'cpu_policy', 'cpu_decision', 'cpu_restoration', 'trial_boundary',
+                     'policy_started', 'provider_configuration', 'rule_reference', 'decision_context', 'model_proposal',
+                     'model_rejection', 'policy_fallback', 'decision_command', 'decision_acknowledgement',
+                     'policy_stopped', 'model_dispatched', 'decision_result',
+                     'priority_requested', 'priority_dispatched', 'priority_outcome', 'resource_effect'}):
+                raise ValueError('Unsupported audit event')
+            self.store.record(self.session_id, message, time.monotonic_ns())
         elif op == 'stop_session':
             self.stop_session('completed')
         elif op == 'history':
             self.refresh_history()
         elif op == 'load':
             self.emit('loaded', recording=self.store.load(request['session_id'], request.get('workload_offset', 0)))
+        elif op == 'decision_history':
+            try:
+                page = self.store.decision_page(request['session_id'], before=request.get('before'),
+                    after=request.get('after'), before_cycle=request.get('before_cycle'),
+                    after_cycle=request.get('after_cycle'))
+            except ValueError:
+                self.emit('decision_history', session_id=request['session_id'], token=request['token'],
+                          error='History position unavailable. Use Jump to latest and try again.')
+            else:
+                self.emit('decision_history', session_id=request['session_id'], token=request['token'], page=page)
         elif op == 'export':
             self.store.export(request['session_id'], request['path'], request['format'])
             self.emit('exported', path=str(request['path']))
@@ -172,17 +304,24 @@ class SessionWorker(threading.Thread):
             self.closed = True
         if message['kind'] == 'ack':
             self.pending.pop(message['request_id'], None)
+            self.pending_timeouts.pop(message['request_id'], None)
+            self.advance_preflight(message)
         if message['kind'] != 'raw':
             anchor_mono, anchor_receipt = self.clock_anchor
             # Compare elapsed durations, never absolute host and VM clocks.
             lag = (receipt_ns - anchor_receipt) - (message['mono_ns'] - anchor_mono)
             stale = lag > 3_000_000_000 or time.monotonic_ns() - receipt_ns > 3_000_000_000
             self.emit(message['kind'], **{k: v for k, v in message.items() if k != 'kind'},
-                      host_receipt_ns=receipt_ns, stale=stale)
+                      host_receipt_ns=receipt_ns, stale=stale, session_id=self.session_id)
+        else:
+            self.emit('raw', **{k: v for k, v in message.items() if k != 'kind'},
+                      host_receipt_ns=receipt_ns, session_id=self.session_id)
         return message['kind']
 
     def pump(self):
         now = time.monotonic()
+        loop_delay_ms = max(0, (now - self.last_pump) * 1000) if self.last_pump else 0
+        self.last_pump = now
         for _ in range(200):
             item = self.runtime.poll_message()
             if not item:
@@ -194,11 +333,27 @@ class SessionWorker(threading.Thread):
             self.last_heartbeat = now
         if self.runtime.process.poll() is not None:
             raise RuntimeError('Docker sandbox disconnected: ' + '\n'.join(self.runtime.diagnostics))
-        if any(now - started > 5 for started in self.pending.values()):
-            raise RuntimeError('Sandbox did not acknowledge a control within 5 seconds')
+        expired = [request_id for request_id, started in self.pending.items()
+                   if now - started > self.pending_timeouts.get(request_id, 5)]
+        if expired:
+            if self.preflight and self.preflight['stage'] != 'abort' \
+                    and self.preflight['expected']['request_id'] in expired:
+                self.pending.pop(self.preflight['expected']['request_id'], None)
+                self.abort_preflight('preflight acknowledgement timed out')
+            else:
+                raise RuntimeError('Sandbox did not acknowledge a control within 5 seconds')
         if now - self.last_flush >= 1:
+            started = time.monotonic()
             self.store.flush()
+            self.flush_duration_ms = (time.monotonic() - started) * 1000
             self.last_flush = now
+        if now - self.last_health >= 5:
+            self.store.record(self.session_id, {'kind': 'host_health', 'heartbeat_age_ms':
+                max(0, (now - self.last_heartbeat) * 1000), 'worker_loop_delay_ms': loop_delay_ms,
+                'flush_duration_ms': self.flush_duration_ms, 'pending_controls': len(self.pending),
+                'request_queue': self.requests.qsize(), 'update_queue': self.updates.qsize()},
+                time.monotonic_ns())
+            self.last_health = now
 
     def stop_session(self, status):
         if not self.active:
@@ -230,9 +385,16 @@ class SessionWorker(threading.Thread):
                 self.runtime.close_transport()
             except Exception as exc:
                 errors.append(str(exc))
+            try:
+                self.activity.end()
+            except Exception as exc:
+                errors.append(f'App Nap activity release failed: {exc}')
             self.active = False
             self.pending.clear()
+            self.pending_timeouts.clear()
             try:
+                self.store.record(self.session_id, {'kind': 'host_activity', 'state': 'ended',
+                    'app_nap_prevented': self.activity.active, 'idle_system_sleep_allowed': True}, time.monotonic_ns())
                 if errors:
                     self.store.record(self.session_id, {'kind': 'failure', 'message': '; '.join(errors),
                         'diagnostics': list(getattr(self.runtime, 'diagnostics', [])),

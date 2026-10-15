@@ -1,4 +1,7 @@
 .venv/
+.env
+.env.*
+!.env.example
 __pycache__/
 *.pyc
 *.egg-info/
@@ -8,3 +11,7 @@ deployment/
 runs/
 .superpowers/
 .codebase-memory/
+.implementation/
+nuitka-crash-report.xml
+.DS_Store
+output

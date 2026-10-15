@@ -4,3 +4,5 @@
 !protocol.py
 !presets.py
 !agent.py
+!resources.py
+!network.py

@@ -40,6 +40,7 @@ def main():
     try:
         window.start_session()
         until(lambda: window.active, 180)
+        until(lambda: window.preflight_complete)
         window.start_all()
         until(lambda: all(w['status'] == 'running' for w in window.workloads.values()))
         key = next(iter(window.workloads))

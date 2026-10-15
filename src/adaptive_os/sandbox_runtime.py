@@ -17,7 +17,7 @@ from .docker_runtime import DockerError, DockerRuntime, validate_container_id
 from .sandbox.protocol import VERSION, encode, identifier, validate_command
 
 LABELS = {'project': 'adaptive-os-desktop', 'architecture': 'single-sandbox-v2'}
-CONTEXT_FILES = ('Dockerfile', '.dockerignore', '__init__.py', 'protocol.py', 'agent.py', 'presets.py')
+CONTEXT_FILES = ('Dockerfile', '.dockerignore', '__init__.py', 'protocol.py', 'agent.py', 'presets.py', 'resources.py', 'network.py')
 
 
 def docker_executable():

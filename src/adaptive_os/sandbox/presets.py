@@ -5,9 +5,60 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import select
+import sys
 import time
 
 from .protocol import encode, identifier, validate_config
+from .resources import Cache, MeasurementWindow
+
+
+def run_cache(config):
+    cache = Cache(config['mib'], seed=config['seed'], working_set_mib=config['working_set_mib'], refill_ms=config['refill_ms'])
+    start = last = time.monotonic_ns()
+    window = MeasurementWindow(start)
+    latest = None
+    sequence = units = checksum = 0
+    control_buffer = b''
+    os.set_blocking(sys.stdin.fileno(), False)
+    print(encode({'kind': 'allocation_ack', 'request_id': 'initial', 'allocated_mib': cache.allocated_mib, 'ok': True}).rstrip(), flush=True)
+    try:
+        while True:
+            if select.select([sys.stdin], [], [], 0)[0]:
+                data = os.read(sys.stdin.fileno(), 4096)
+                if not data:
+                    return
+                control_buffer += data
+                if len(control_buffer) > 4096:
+                    raise ValueError('Cache command bound exceeded')
+                while b'\n' in control_buffer:
+                    line, control_buffer = control_buffer.split(b'\n', 1)
+                    command = json.loads(line)
+                    ok = True
+                    try:
+                        cache.resize(command['mib'])
+                    except (OSError, MemoryError):
+                        ok = False
+                    print(encode({'kind': 'allocation_ack', 'request_id': command['request_id'],
+                                  'allocated_mib': cache.allocated_mib, 'ok': ok}).rstrip(), flush=True)
+            now = time.monotonic_ns()
+            while now >= window.start + 5_000_000_000:
+                latest = window.finish()
+                window = MeasurementWindow(window.start + 5_000_000_000)
+            before = cache.misses
+            checksum ^= cache.request()
+            completed = time.monotonic_ns()
+            units += 1
+            window.add((completed - now) / 1e6, cache.misses != before)
+            if completed - last >= 1_000_000_000:
+                print(encode({'sequence': sequence, 'start_ns': start, 'mono_ns': completed,
+                    'units': units, 'ticks': [], 'cache_hits': cache.hits, 'cache_misses': cache.misses,
+                    'configured_mib': config['mib'], 'allocated_mib': cache.allocated_mib,
+                    'resource_window': latest, 'checksum': checksum}).rstrip(), flush=True)
+                sequence += 1
+                last = completed
+    finally:
+        cache.close()
 
 
 def io_step(file, block, state):
@@ -29,8 +80,59 @@ def io_step(file, block, state):
     return amount, (writing, offset)
 
 
-def run(preset, config, workload_id, cpu):
+def run_network(config, workload_id, port):
+    from .network import connect_flow, request_record, receive_record
+    identity = int(Path('/proc/self/stat').read_text().rsplit(')', 1)[1].split()[19])
+    stream = connect_flow(port, workload_id, identity)
+    start = last = scheduled = time.monotonic_ns()
+    window = MeasurementWindow(start)
+    latest = None
+    sequence = units = records = failures = 0
+    delay = 0.
+    foreground = config['foreground']
+    size = config['response_kib'] * 1024 if foreground else 256 * 1024
+    period = config['period_ms'] * 1_000_000
+    try:
+        while True:
+            if foreground:
+                time.sleep(max(0, (scheduled - time.monotonic_ns()) / 1e9))
+            now = time.monotonic_ns()
+            while now >= window.start + 5_000_000_000:
+                latest = window.finish()
+                window = MeasurementWindow(window.start + 5_000_000_000)
+            failed = False
+            try:
+                request_record(stream, records, size)
+                delay = receive_record(stream, records, size)
+                units += size
+                records += 1
+            except (OSError, ValueError):
+                failures += 1
+                failed = True
+            completed = time.monotonic_ns()
+            latency = (completed - (scheduled if foreground else now)) / 1e6
+            window.add(latency, failed or (foreground and latency > config['deadline_ms']), failed)
+            if foreground:
+                scheduled += period
+            if completed - last >= 1_000_000_000 or failed:
+                print(encode({'sequence': sequence, 'start_ns': start, 'mono_ns': completed,
+                    'units': units, 'ticks': [], 'resource_window': latest, 'completed_records': records,
+                    'failed_transfers': failures, 'queue_delay_ms': delay,
+                    'delivered_mbps': units * 8 / max(1, completed - start) * 1000}).rstrip(), flush=True)
+                sequence += 1
+                last = completed
+            if failed:
+                raise OSError('Owned network transfer failed')
+    finally:
+        stream.close()
+
+
+def run(preset, config, workload_id, cpu, relay_port=0):
     os.sched_setaffinity(0, {cpu})
+    if preset == 'cache':
+        return run_cache(config)
+    if preset == 'network':
+        return run_network(config, workload_id, relay_port)
     start = last = time.monotonic_ns()
     scheduled = start
     units = sequence = 0
@@ -90,9 +192,10 @@ def main():
     parser.add_argument('config')
     parser.add_argument('workload_id')
     parser.add_argument('cpu', type=int)
+    parser.add_argument('relay_port', type=int, nargs='?', default=0)
     args = parser.parse_args()
     run(args.preset, validate_config(args.preset, json.loads(args.config)),
-        identifier(args.workload_id), args.cpu)
+        identifier(args.workload_id), args.cpu, args.relay_port)
 
 
 if __name__ == '__main__':

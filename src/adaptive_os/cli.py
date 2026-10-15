@@ -22,6 +22,9 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     desktop = commands.add_parser('desktop', help='launch the native single-sandbox desktop app')
     desktop.add_argument('--data-dir', type=Path)
+    desktop.add_argument('--backend', choices=('docker', 'guest-linux'), default='docker')
+    desktop.add_argument('--jev-env-file', type=Path, metavar='PATH',
+                         help='load JEV_API_KEY from a .env file into the masked Providers field')
     for command in ("preflight", "calibrate", "run", "report", "cleanup"):
         subparser = commands.add_parser(command, help='legacy multi-container benchmark workflow')
         subparser.add_argument("--runs-dir", type=Path, default=Path("runs"))
@@ -142,7 +145,12 @@ def main(argv: list[str] | None = None) -> int:
         except ImportError:
             print('Install desktop support: python -m pip install -e ".[desktop]"', file=sys.stderr)
             return 1
-        return desktop_main(['--data-dir', str(args.data_dir)] if args.data_dir else [])
+        desktop_args = ['--data-dir', str(args.data_dir)] if args.data_dir else []
+        if args.backend != 'docker':
+            desktop_args += ['--backend', args.backend]
+        if args.jev_env_file:
+            desktop_args += ['--jev-env-file', str(args.jev_env_file)]
+        return desktop_main(desktop_args)
     runtime = DockerRuntime()
     try:
         if args.command == "preflight":

@@ -11,43 +11,49 @@ import time
 import uuid
 
 from adaptive_os.desktop_worker import SessionWorker
+from adaptive_os.sandbox.protocol import VERSION
 from adaptive_os.sandbox_runtime import SandboxRuntime
 from adaptive_os.session_store import SessionStore
 
 
-def child(database):
+def child(database, resource='cpu'):
     worker = SessionWorker(database)
     worker.start()
-    rows = [{'id': str(uuid.uuid4()), 'name': preset, 'preset': preset, 'config': {}}
-            for preset in ('periodic', 'cpu')]
-    worker.submit({'op': 'start_session', 'workloads': rows})
+    presets = ('periodic', 'cpu') if resource == 'cpu' else (('cache',) * 4 if resource == 'memory' else ('network',) * 4)
+    rows = [{'id': str(uuid.uuid4()), 'name': preset, 'preset': preset,
+             'config': {'foreground': index == 0} if resource == 'network' else {}}
+            for index, preset in enumerate(presets)]
+    worker.submit({'op': 'start_session', 'workloads': rows, 'resource': resource})
     started = 0
     while True:
         message = worker.updates.get(timeout=180)
         if message['kind'] == 'error':
             raise RuntimeError(message['message'])
-        if message['kind'] == 'ready':
+        if message['kind'] == 'ack' and message.get('op') == ('priority_preflight' if resource == 'cpu' else 'configure'):
+            assert message['ok'], message
             for row in rows:
                 worker.submit({'op': 'control', 'workload': row, 'command': {
-                    'v': 2, 'request_id': str(uuid.uuid4()), 'op': 'start', 'workload_id': row['id'],
+                    'v': VERSION, 'request_id': str(uuid.uuid4()), 'op': 'start', 'workload_id': row['id'],
                     'preset': row['preset'], 'config': row['config']}})
         if message['kind'] == 'ack' and message['op'] == 'start':
             assert message['ok'], message
             started += 1
-            if started == 2:
+            if started == len(rows):
                 print(json.dumps({'session_id': worker.session_id, 'container_id': worker.runtime.container_id}), flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--child', type=Path)
+    parser.add_argument('--resource', choices=('cpu', 'memory', 'network'), default='cpu')
     args = parser.parse_args()
     if args.child:
-        child(args.child)
+        child(args.child, args.resource)
         return
     output = Path('build/crash-verification') / str(uuid.uuid4())
     output.mkdir(parents=True)
-    process = subprocess.Popen([sys.executable, __file__, '--child', str(output / 'sessions-v2.sqlite3')],
+    process = subprocess.Popen([sys.executable, __file__, '--child', str(output / 'sessions-v2.sqlite3'),
+                                '--resource', args.resource],
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     received = queue.Queue()
     threading.Thread(target=lambda: received.put(process.stdout.readline()), daemon=True).start()
@@ -72,6 +78,8 @@ def main():
         store.close()
         assert session_id in [row['session_id'] for row in runtime.leftovers()]
         print('PASS: sandbox exited, recording recovered as interrupted.', flush=True)
+        (output / 'report.json').write_text(json.dumps(dict(passed=True, resource=args.resource,
+            session_id=session_id, lease_seconds=10, recording_interrupted=True), indent=2))
     finally:
         if process.poll() is None:
             process.kill()

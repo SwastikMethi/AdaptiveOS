@@ -1,0 +1,23 @@
+[Unit]
+Description=Adaptive OS guest resource service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/python3 -I /opt/adaptive-os-guest/service.py
+User=root
+Group=root
+CPUAffinity=0
+UMask=0077
+StateDirectory=adaptive-os
+StateDirectoryMode=0711
+RuntimeDirectory=adaptive-os
+RuntimeDirectoryMode=0711
+RuntimeDirectoryPreserve=yes
+Restart=on-failure
+RestartSec=1
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Adaptive OS managed applications (fixed safety boundary)
+
+[Slice]
+AllowedCPUs=1-3
+CPUAccounting=yes
+MemoryAccounting=yes
+MemoryLow=0
+MemoryMin=0
+MemoryHigh=infinity
+MemoryMax=4G

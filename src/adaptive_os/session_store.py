@@ -93,6 +93,64 @@ class SessionStore:
         return [{**dict(row), 'config': json.loads(row['config'])} for row in self.db.execute(
             'SELECT * FROM workloads WHERE session_id=? ORDER BY rowid LIMIT ? OFFSET ?', (session_id, limit, offset))]
 
+    def decision_page(self, session_id, *, before=None, after=None, before_cycle=None, after_cycle=None):
+        """Page whole cycles by their first event, so late replies cannot reorder history."""
+        session_id = identifier(session_id)
+        if (before is not None and after is not None) or any(
+                value is not None and (type(value) is not int or value < 1) for value in (before, after)):
+            raise ValueError('Invalid decision history cursor')
+        # Old recordings did not bind every event to a generation. The nearest
+        # preceding policy activation separates reused window IDs without guessing timings.
+        cycle = """COALESCE(json_extract(m.payload,'$.cycle_id'),
+            'legacy:' || COALESCE((SELECT MAX(p.id) FROM messages p WHERE p.session_id=m.session_id
+                AND p.kind='policy_started' AND p.id<=m.id),0) || ':' ||
+            COALESCE(json_extract(m.payload,'$.decision_window'),
+                json_extract(m.payload,'$.window_start_ns') || ':' || json_extract(m.payload,'$.window_end_ns')))"""
+        roots = f"""SELECT MIN(m.id) AS first_id, {cycle} AS cycle_id FROM messages m
+            WHERE m.session_id=? AND (m.kind='rule_reference' OR
+                (m.kind='priority_requested' AND json_extract(m.payload,'$.source') IN ('manual','restoration')) OR
+                (m.kind='cpu_decision' AND NOT EXISTS(SELECT 1 FROM messages r
+                    WHERE r.session_id=m.session_id AND r.kind='rule_reference')))
+            GROUP BY cycle_id HAVING cycle_id IS NOT NULL"""
+        if before_cycle is not None or after_cycle is not None:
+            if before is not None or after is not None or (before_cycle is not None and after_cycle is not None):
+                raise ValueError('Invalid decision history cursor')
+            key = before_cycle if before_cycle is not None else after_cycle
+            if not isinstance(key, str) or not 1 <= len(key) <= 256:
+                raise ValueError('Invalid decision cycle')
+            row = self.db.execute(f'SELECT first_id FROM ({roots}) WHERE cycle_id=?', (session_id, key)).fetchone()
+            if row is None:
+                raise ValueError('Decision cycle is not recorded yet')
+            if before_cycle is not None:
+                before = row[0]
+            else:
+                after = row[0]
+        condition, args = ('first_id < ?', [before]) if before is not None else (
+                          ('first_id > ?', [after]) if after is not None else ('1', []))
+        rows = self.db.execute(f'SELECT * FROM ({roots}) WHERE {condition} ORDER BY first_id '
+                               + ('ASC' if after is not None else 'DESC') + ' LIMIT 100',
+                               [session_id, *args]).fetchall()
+        rows = sorted(rows, key=lambda row: row['first_id'], reverse=True)
+        cycles = {row['cycle_id']: {'cycle_id': row['cycle_id'], 'first_id': row['first_id'], 'events': []}
+                  for row in rows}
+        if cycles:
+            keys = list(cycles)
+            # New recordings use the direct binding; legacy pages use the compatibility expression.
+            expression = cycle if any(key.startswith('legacy:') for key in keys) else "json_extract(m.payload,'$.cycle_id')"
+            query = f"SELECT m.id,m.payload,m.receipt_ns,{expression} AS cycle_id FROM messages m WHERE m.session_id=? "
+            query += f"AND ({expression}) IN ({','.join('?' for _ in keys)}) ORDER BY m.id"
+            for row in self.db.execute(query, [session_id, *keys]):
+                event = json.loads(row['payload'])
+                event.update(cycle_id=row['cycle_id'], record_id=row['id'], host_receipt_ns=row['receipt_ns'])
+                cycles[row['cycle_id']]['events'].append(event)
+        oldest = rows[-1]['first_id'] if rows else None
+        newest = rows[0]['first_id'] if rows else None
+        bounds = self.db.execute(f'SELECT MIN(first_id),MAX(first_id) FROM ({roots})', (session_id,)).fetchone()
+        return {'cycles': list(cycles.values()), 'oldest': oldest, 'newest': newest,
+                'has_older': oldest is not None and bounds[0] < oldest,
+                'has_newer': newest is not None and bounds[1] > newest,
+                'workload_names': {row['id']: row['name'] for row in self.workloads(session_id)}}
+
     def load(self, session_id, workload_offset=0):
         session = self.session(session_id)
         if type(workload_offset) is not int or workload_offset < 0:
@@ -114,7 +172,8 @@ class SessionStore:
             "SELECT payload FROM (SELECT id,payload FROM messages WHERE session_id=? "
             "AND kind NOT IN ('sample','raw') ORDER BY id DESC LIMIT 500) ORDER BY id", (session_id,))]
         return {'session': session, 'workloads': self.workloads(session_id, MAX_WORKLOADS, workload_offset),
-                'workload_offset': workload_offset, 'workload_total': total, 'samples': samples, 'events': events}
+                'workload_offset': workload_offset, 'workload_total': total, 'samples': samples, 'events': events,
+                'decisions': self.decision_page(session_id)}
 
     def export(self, session_id, path, format):
         if format not in ('json', 'csv'):
@@ -140,7 +199,9 @@ class SessionStore:
                 else:
                     fields = ['kind', 'sequence', 'workload_id', 'mono_ns', 'cpu_pct', 'rss_mib',
                               'app_rate', 'app_unit', 'nice', 'read_bytes', 'write_bytes',
-                              'miss_rate', 'p95_lateness_ms', 'p95_wakeup_ms', 'warmup']
+                              'miss_rate', 'p95_lateness_ms', 'p95_wakeup_ms', 'warmup',
+                              'resource', 'allocated', 'configured_capacity', 'cache_hits', 'cache_misses',
+                              'p95_latency_ms', 'queue_delay_ms', 'completed_records', 'failed_transfers']
                     writer = csv.writer(stream)
                     writer.writerow(['session_id', 'host_receipt_ns', *fields, 'payload'])
                     for row in rows:

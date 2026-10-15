@@ -1,9 +1,17 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
-from adaptive_os.cli import build_parser
+from adaptive_os.cli import build_parser, main
 
 
 class CliTest(unittest.TestCase):
+    def test_desktop_forwards_jev_env_file(self):
+        desktop_main = Mock(return_value=0)
+        with patch.dict('sys.modules', {'adaptive_os.desktop': SimpleNamespace(main=desktop_main)}):
+            self.assertEqual(main(['desktop', '--data-dir', 'recordings', '--jev-env-file', '.env']), 0)
+        desktop_main.assert_called_once_with(['--data-dir', 'recordings', '--jev-env-file', '.env'])
+
     def test_expected_commands_exist(self):
         for command in ("preflight", "calibrate", "run", "report", "cleanup"):
             with self.subTest(command=command):
